@@ -13,16 +13,16 @@ phase unwrapping, and cycle-slip detection belong upstream.
 
 ## Install
 
-For an unpublished local checkout:
+Add tychonic from [crates.io](https://crates.io/crates/tychonic):
 
 ```toml
 [dependencies]
-tychonic = { path = "/path/to/tychonic" }
+tychonic = "0.9.0"
 ```
 
-After registry publication, use `tychonic = "0.9.0"`. The portable distribution
-is a Cargo source crate. `tychonic::satkit` and `tychonic::numeris` re-export
-the dependency versions accepted by the API.
+See the [API documentation](https://docs.rs/tychonic) for available types and
+functions. `tychonic::satkit` and `tychonic::numeris` re-export the dependency
+versions accepted by the API.
 
 ## Prepare individual measurements
 
@@ -137,7 +137,7 @@ cargo doc --locked --no-deps --lib
 cargo bench --locked --bench kernels
 ```
 
-[Research tools](https://github.com/Tycho887/tychonic/blob/main/tools/README.md) live in a separate unpublished crate. Generated
+[Research tools](https://github.com/Tycho887/tychonic/blob/main/tools/README.md) live in a separate development crate. Generated
 runs stay locally under ignored `artifacts/`; local paper PDFs stay under
 ignored `references/`. Selected documentation figures belong in `docs/assets/`.
 See [references](references/README.md) and [release packaging](docs/publishing.md).

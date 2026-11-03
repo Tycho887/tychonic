@@ -1,7 +1,7 @@
 # Research and reproduction tools
 
-Run these commands from the **repository root**. This is a separate unpublished
-crate; tooling dependencies and executables are excluded from the library crate.
+Run these commands from the **repository root**. This is a separate development
+crate; tooling dependencies and executables are excluded from the library package.
 Its lockfile is retained for reproducibility. Satkit data must be provisioned
 before offline propagation. Plotting requires Python, NumPy, and Matplotlib.
 

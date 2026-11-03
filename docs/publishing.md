@@ -1,4 +1,4 @@
-# Packaging v0.9.0
+# Release v0.9.0 to crates.io
 
 Tychonic distributes portable Rust source as `tychonic-0.9.0.crate`. The manifest
 allowlist includes library source, tests, benchmark support, concise examples,
@@ -14,13 +14,12 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked --release --lib
 cargo doc --locked --no-deps --lib
 cargo check --manifest-path tools/Cargo.toml --locked --all-targets --all-features
-cargo package --locked --allow-dirty --list
-cargo package --locked --offline --allow-dirty
+cargo package --locked --list
+cargo package --locked --offline
 ```
 
-`--allow-dirty` permits packaging a reviewed working tree before committing;
-omit it for a release from a clean commit. Verification builds the extracted
-source. The archive is `target/package/tychonic-0.9.0.crate` and local API
+Package a clean release commit. Verification builds the extracted source.
+The archive is `target/package/tychonic-0.9.0.crate` and generated API
 documentation is `target/doc/tychonic/index.html`. A compiled `.rlib` is tied
 to its compiler, platform and dependencies; distribute the source archive.
 
@@ -30,16 +29,19 @@ publication. Test and benchmark fixtures must depend only on packaged files.
 Simulation reproduction instructions are in the repository's
 [tools guide](https://github.com/Tycho887/tychonic/blob/main/tools/README.md).
 
-After the release commit is reviewed, tag it `v0.9.0`. Registry publication is
-a separate action. Authenticate locally with Cargo's credential flow, then run
-`cargo publish --locked --dry-run` before `cargo publish --locked`. Version
-0.9.0 can be published only once. A private registry uses Cargo's `--registry`
-option and the corresponding configured credential provider.
+After the release commit is reviewed, tag it `v0.9.0`. Authenticate with Cargo's
+credential flow, then verify and publish to crates.io:
 
-Consumers may use `tychonic = "0.9.0"` after registry publication, a path to
-the extracted source before publication, or a Git dependency on an existing tag:
+```sh
+cargo publish --locked --dry-run
+cargo publish --locked
+```
+
+Version 0.9.0 can be published only once.
+
+Consumers install from crates.io:
 
 ```toml
 [dependencies]
-tychonic = { git = "https://github.com/Tycho887/tychonic", tag = "v0.9.0" }
+tychonic = "0.9.0"
 ```
