@@ -88,6 +88,49 @@ for `estimate::Observation` and `filter.observe`. A prepared facade batch also
 supplies `batch.joint_observation::<M>(row)` with values, full covariance, epoch,
 and model; M is the component count, from 1 through 5.
 
+## Correct a TLE epoch
+
+`estimate::TcaUkf` estimates `[dT_seconds, range_rate_bias_m_per_s]` for one
+pass from combined range-rate and azimuth/elevation readings. Positive `dT`
+moves the prior TLE epoch later while preserving its other elements. Satellite
+propagation, station geometry, and frame conversion all use the actual reading
+time. Range-rate is positive when receding; angles are radians.
+
+```rust,no_run
+use tychonic::{
+    estimate::{TcaUkf, UpdateOptions, tca_measurement_noise},
+    kernels::{KernelError, Measurement, Result},
+    numeris::{Matrix, Vector},
+    satkit::TLE,
+};
+
+fn correct_pass(prior: TLE, readings: &[Measurement]) -> Result<TcaUkf> {
+    let epoch = readings.first().ok_or(KernelError::InvalidInput("empty pass"))?.time;
+    // Standard deviations: 150 seconds of epoch error and 200 m/s of bias.
+    let covariance = Matrix::new([[150.0_f64.powi(2), 0.0], [0.0, 200.0_f64.powi(2)]]);
+    let mut filter = TcaUkf::new(prior, epoch, Vector::zeros(), covariance)?;
+    let noise = tca_measurement_noise(0.5)?; // 0.5 m/s RR; 2.5-degree az/el.
+    for reading in readings {
+        filter.observe(reading, &noise, None, UpdateOptions::default())?;
+    }
+    let corrected_tle = filter.corrected_tle()?;
+    // Persist corrected_tle and filter.state()[1] as separate orbit/sensor results.
+    Ok(filter)
+}
+```
+
+`tca_measurement_noise` treats 2.5 degrees as an independent Gaussian 1σ for
+each angle; its returned `MeasurementNoise` can be adjusted in radians. There
+is no hard angular bound. State and bias remain constant between readings
+unless a discretized 2×2 process covariance is supplied. Readings must be
+chronological; same-time updates add no process noise. NIS gating is disabled
+by default to allow acquisition with a distant prior. A failed reading rolls
+back prediction and update; a gated reading retains prediction.
+
+Choose prior covariance to cover the expected epoch error. The UKF uses five
+sigma points and a circular azimuth mean; it assumes one roughly Gaussian
+solution and does not search across passes or fit other orbital elements.
+
 ## Unknown RF offsets and drift
 
 `m::RfBuilder` accepts `RfPriors` with named orbit, frequency-offset and

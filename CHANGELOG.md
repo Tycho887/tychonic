@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add a two-state TCA UKF for TLE epoch correction and a constant pass
+  range-rate bias, using combined range-rate and soft azimuth/elevation readings.
+- Default TCA pointing noise to independent 2.5-degree standard deviations;
+  retain observation-time station geometry and invalidate shifted SGP4 caches.
+
 ## 0.9.0
 
 - Add a calibrated facade for standalone Doppler Hz, continuous phase difference,
