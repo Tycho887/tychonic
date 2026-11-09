@@ -2,7 +2,6 @@
 use super::*;
 use numeris::{DynMatrix, DynVector};
 use satkit::Instant;
-use std::sync::Arc;
 
 /// One simultaneous geometric observation with its epoch and station location.
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +39,7 @@ pub fn range_rate_partial(
         return Err(KernelError::ZeroRange);
     }
     if !rho.is_finite() {
-        return Err(KernelError::InvalidInput("range exceeds numeric range"));
+        return Err(KernelError::Numerical("range exceeds numeric range"));
     }
     let los = rho_vec / rho;
     let rho_dot = los.dot(&v_rel);
@@ -51,7 +50,7 @@ pub fn range_rate_partial(
         h[(0, k + 3)] = los[k];
     }
     if !rho_dot.is_finite() || !finite(&h) {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "range-rate geometry exceeds numeric range",
         ));
     }
@@ -122,14 +121,14 @@ pub fn az_el_partial_prepared(
         h[(1, k)] = d_el[k];
     }
     if !finite(&h) || !rho.is_finite() {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "angle geometry exceeds numeric range",
         ));
     }
     Ok(([az, el], h))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FullJacobian {
     pub range_rate: DynMatrix<f64>,
     pub azimuth: DynMatrix<f64>,
@@ -195,7 +194,7 @@ pub fn compute_full_jacobian(
     Ok(jac)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Observations {
     pub range_rate: Vec<f64>,
     pub azimuth: Vec<f64>,
@@ -208,7 +207,7 @@ pub struct Observations {
 
 /// Owned output, also usable as scratch across evaluations of the same shape.
 /// After an evaluation error its contents are unspecified.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Evaluation {
     pub residual: DynVector<f64>,
     pub jacobian: DynMatrix<f64>,
@@ -237,6 +236,18 @@ impl Evaluation {
         }
         Ok(())
     }
+    pub(crate) fn check_finite(&self) -> Result<()> {
+        if !self
+            .residual
+            .as_slice()
+            .iter()
+            .chain(self.jacobian.as_slice())
+            .all(|v| v.is_finite())
+        {
+            return Err(KernelError::Numerical("evaluation exceeds numeric range"));
+        }
+        Ok(())
+    }
     pub fn rss(&self) -> f64 {
         self.residual.dot(&self.residual)
     }
@@ -252,43 +263,57 @@ pub enum MeasurementKind {
     Joint,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct ObservationColumn {
     values: Vec<f64>,
     sigma: f64,
     angular: bool,
 }
 
-/// Immutable measurement-specific batch. Geometry can be shared using `Arc`.
-/// Rows are grouped by observable: RR; AZ, EL; or RR, AZ, EL.
-#[derive(Clone, Debug)]
-pub struct PreparedBatch {
-    geometry: Arc<PreparedGeometry>,
-    kind: MeasurementKind,
-    observations: Vec<ObservationColumn>,
-    interferometer: Option<Interferometer>,
-    joint: Option<Box<crate::measurements::JointBatch>>,
+#[derive(Debug)]
+enum BatchData {
+    RangeRate([ObservationColumn; 1]),
+    PhaseDifference {
+        observations: [ObservationColumn; 1],
+        interferometer: Interferometer,
+    },
+    AzimuthElevation([ObservationColumn; 2]),
+    Combined([ObservationColumn; 3]),
+    Joint(Box<crate::measurements::JointBatch>),
 }
 
-impl PreparedBatch {
+/// Immutable batch with explicit geometry ownership and validated model data.
+#[derive(Debug)]
+pub struct PreparedBatch<'g> {
+    geometry: GeometrySource<'g>,
+    data: BatchData,
+}
+
+impl<'g> PreparedBatch<'g> {
     pub(crate) fn from_joint(
-        geometry: Arc<PreparedGeometry>,
+        geometry: impl Into<GeometrySource<'g>>,
         joint: crate::measurements::JointBatch,
     ) -> Self {
         Self {
-            geometry,
-            kind: MeasurementKind::Joint,
-            observations: Vec::new(),
-            interferometer: None,
-            joint: Some(Box::new(joint)),
+            geometry: geometry.into(),
+            data: BatchData::Joint(Box::new(joint)),
         }
     }
-
+    fn observations(&self) -> &[ObservationColumn] {
+        match &self.data {
+            BatchData::RangeRate(observations)
+            | BatchData::PhaseDifference { observations, .. } => observations,
+            BatchData::AzimuthElevation(observations) => observations,
+            BatchData::Combined(observations) => observations,
+            BatchData::Joint(_) => &[],
+        }
+    }
     /// Number of physical components per epoch, including both angles.
     pub fn components(&self) -> usize {
-        self.joint
-            .as_ref()
-            .map_or(self.observations.len(), |j| j.dimension())
+        match &self.data {
+            BatchData::Joint(joint) => joint.dimension(),
+            _ => self.observations().len(),
+        }
     }
 
     /// Get a facade observation with its full physical covariance and sensor.
@@ -296,18 +321,18 @@ impl PreparedBatch {
     pub fn joint_observation<const M: usize>(
         &self,
         row: usize,
-    ) -> Result<crate::estimate::Observation<M, crate::measurements::CalibratedSensor<M>>> {
-        self.joint
-            .as_ref()
-            .ok_or(KernelError::InvalidInput(
+    ) -> Result<crate::estimate::Observation<M, crate::measurements::CalibratedSensor<'_, M>>> {
+        match &self.data {
+            BatchData::Joint(joint) => joint.observation(&self.geometry, row),
+            _ => Err(KernelError::InvalidInput(
                 "batch is not a joint passive batch",
-            ))?
-            .observation(&self.geometry, row)
+            )),
+        }
     }
 
     /// Calibrated carrier-relative Doppler in Hz.
     pub fn doppler(
-        geometry: Arc<PreparedGeometry>,
+        geometry: impl Into<GeometrySource<'g>>,
         carrier_hz: f64,
         values_hz: Vec<f64>,
         sigma_hz: f64,
@@ -317,7 +342,7 @@ impl PreparedBatch {
 
     /// Calibrated standalone f1 − f2 in Hz.
     pub fn differential_doppler(
-        geometry: Arc<PreparedGeometry>,
+        geometry: impl Into<GeometrySource<'g>>,
         interferometer: Interferometer,
         values_hz: Vec<f64>,
         sigma_hz: f64,
@@ -328,44 +353,46 @@ impl PreparedBatch {
     /// Calibrated continuous phase (rad). Use PassiveRfProblem to estimate
     /// receiver offsets and correlated OU drift.
     pub fn phase_difference(
-        geometry: Arc<PreparedGeometry>,
+        geometry: impl Into<GeometrySource<'g>>,
         interferometer: Interferometer,
         values: Vec<f64>,
         sigma_rad: f64,
     ) -> Result<Self> {
-        let mut batch = Self::new(
+        Self::new(
             geometry,
-            MeasurementKind::PhaseDifference,
-            vec![ObservationColumn {
-                values,
-                sigma: sigma_rad,
-                angular: false,
-            }],
-        )?;
-        batch.interferometer = Some(interferometer);
-        Ok(batch)
+            BatchData::PhaseDifference {
+                observations: [ObservationColumn {
+                    values,
+                    sigma: sigma_rad,
+                    angular: false,
+                }],
+                interferometer,
+            },
+        )
     }
     pub fn interferometer(&self) -> Option<Interferometer> {
-        self.interferometer
+        match self.data {
+            BatchData::PhaseDifference { interferometer, .. } => Some(interferometer),
+            _ => None,
+        }
     }
     pub fn range_rate(
-        geometry: Arc<PreparedGeometry>,
+        geometry: impl Into<GeometrySource<'g>>,
         values: Vec<f64>,
         sigma: f64,
     ) -> Result<Self> {
         Self::new(
             geometry,
-            MeasurementKind::RangeRate,
-            vec![ObservationColumn {
+            BatchData::RangeRate([ObservationColumn {
                 values,
                 sigma,
                 angular: false,
-            }],
+            }]),
         )
     }
 
     pub fn azimuth_elevation(
-        geometry: Arc<PreparedGeometry>,
+        geometry: impl Into<GeometrySource<'g>>,
         azimuth: Vec<f64>,
         elevation: Vec<f64>,
         sigma_az: f64,
@@ -373,8 +400,7 @@ impl PreparedBatch {
     ) -> Result<Self> {
         Self::new(
             geometry,
-            MeasurementKind::AzimuthElevation,
-            vec![
+            BatchData::AzimuthElevation([
                 ObservationColumn {
                     values: azimuth,
                     sigma: sigma_az,
@@ -385,15 +411,14 @@ impl PreparedBatch {
                     sigma: sigma_el,
                     angular: false,
                 },
-            ],
+            ]),
         )
     }
 
-    pub fn combined(geometry: Arc<PreparedGeometry>, obs: Observations) -> Result<Self> {
+    pub fn combined(geometry: impl Into<GeometrySource<'g>>, obs: Observations) -> Result<Self> {
         Self::new(
             geometry,
-            MeasurementKind::Combined,
-            vec![
+            BatchData::Combined([
                 ObservationColumn {
                     values: obs.range_rate,
                     sigma: obs.sigma_rr,
@@ -409,7 +434,7 @@ impl PreparedBatch {
                     sigma: obs.sigma_el,
                     angular: false,
                 },
-            ],
+            ]),
         )
     }
 
@@ -420,7 +445,7 @@ impl PreparedBatch {
         let times: Vec<_> = measurements.iter().map(|m| m.time).collect();
         let stations: Vec<_> = measurements.iter().map(|m| m.station).collect();
         Self::combined(
-            Arc::new(PreparedGeometry::new(&times, &stations)?),
+            PreparedGeometry::new(&times, &stations)?,
             Observations {
                 range_rate: measurements.iter().map(|m| m.range_rate).collect(),
                 azimuth: measurements.iter().map(|m| m.azimuth).collect(),
@@ -432,20 +457,22 @@ impl PreparedBatch {
         )
     }
 
-    fn new(
-        geometry: Arc<PreparedGeometry>,
-        kind: MeasurementKind,
-        observations: Vec<ObservationColumn>,
-    ) -> Result<Self> {
-        if geometry.is_empty() {
+    fn new(geometry: impl Into<GeometrySource<'g>>, data: BatchData) -> Result<Self> {
+        let batch = Self {
+            geometry: geometry.into(),
+            data,
+        };
+        if batch.geometry.is_empty() {
             return Err(KernelError::InvalidInput("empty observation batch"));
         }
-        geometry
+        batch
+            .geometry
             .len()
-            .checked_mul(observations.len())
+            .checked_mul(batch.components())
             .ok_or(KernelError::InvalidInput("output dimensions overflow"))?;
-        for obs in &observations {
-            if obs.values.len() != geometry.len() || !obs.values.iter().all(|x| x.is_finite()) {
+        for obs in batch.observations() {
+            if obs.values.len() != batch.geometry.len() || !obs.values.iter().all(|x| x.is_finite())
+            {
                 return Err(KernelError::InvalidInput("observation lengths or values"));
             }
             if !obs.sigma.is_finite() || obs.sigma <= 0.0 {
@@ -454,20 +481,19 @@ impl PreparedBatch {
                 ));
             }
         }
-        Ok(Self {
-            geometry,
-            kind,
-            observations,
-            interferometer: None,
-            joint: None,
-        })
+        Ok(batch)
     }
-
-    pub fn geometry(&self) -> &Arc<PreparedGeometry> {
+    pub fn geometry(&self) -> &PreparedGeometry {
         &self.geometry
     }
     pub fn kind(&self) -> MeasurementKind {
-        self.kind
+        match self.data {
+            BatchData::RangeRate(_) => MeasurementKind::RangeRate,
+            BatchData::PhaseDifference { .. } => MeasurementKind::PhaseDifference,
+            BatchData::AzimuthElevation(_) => MeasurementKind::AzimuthElevation,
+            BatchData::Combined(_) => MeasurementKind::Combined,
+            BatchData::Joint(_) => MeasurementKind::Joint,
+        }
     }
     pub fn timestamps(&self) -> &[Instant] {
         self.geometry.timestamps()
@@ -480,7 +506,7 @@ impl PreparedBatch {
     /// order (RR; AZ, EL; or RR, AZ, EL). Joint batches use
     /// `joint_observation` instead; they and out-of-range indices return `None`.
     pub fn observation_column(&self, index: usize) -> Option<(&[f64], f64)> {
-        self.observations
+        self.observations()
             .get(index)
             .map(|column| (column.values.as_slice(), column.sigma))
     }
@@ -546,30 +572,30 @@ impl PreparedBatch {
                 "batch output or mapping dimensions",
             ));
         }
+        sens.validate_mapping(self.timestamps(), mapping)?;
         output.resize(total_rows, columns)?;
-        if let Some(joint) = &self.joint {
-            return joint.evaluate(&self.geometry, sens, mapping, output, offset);
-        }
-        match (self.kind, columns) {
-            (MeasurementKind::RangeRate | MeasurementKind::PhaseDifference, 6) => {
+        match (&self.data, columns) {
+            (BatchData::Joint(joint), _) => {
+                joint.evaluate(&self.geometry, sens, mapping, output, offset)
+            }
+            (BatchData::RangeRate(_) | BatchData::PhaseDifference { .. }, 6) => {
                 self.evaluate_rows::<1, 6>(sens, mapping, output, offset)
             }
-            (MeasurementKind::RangeRate | MeasurementKind::PhaseDifference, _) => {
+            (BatchData::RangeRate(_) | BatchData::PhaseDifference { .. }, _) => {
                 self.evaluate_rows::<1, 7>(sens, mapping, output, offset)
             }
-            (MeasurementKind::AzimuthElevation, 6) => {
+            (BatchData::AzimuthElevation(_), 6) => {
                 self.evaluate_rows::<2, 6>(sens, mapping, output, offset)
             }
-            (MeasurementKind::AzimuthElevation, _) => {
+            (BatchData::AzimuthElevation(_), _) => {
                 self.evaluate_rows::<2, 7>(sens, mapping, output, offset)
             }
-            (MeasurementKind::Combined, 6) => {
+            (BatchData::Combined(_), 6) => {
                 self.evaluate_rows::<3, 6>(sens, mapping, output, offset)
             }
-            (MeasurementKind::Combined, _) => {
+            (BatchData::Combined(_), _) => {
                 self.evaluate_rows::<3, 7>(sens, mapping, output, offset)
             }
-            (MeasurementKind::Joint, _) => unreachable!("joint batch handled above"),
         }
     }
 
@@ -580,79 +606,95 @@ impl PreparedBatch {
         output: &mut Evaluation,
         offset: usize,
     ) -> Result<()> {
-        let n = self.geometry.len();
-        for i in 0..n {
+        for (i, geometry) in self.geometry.iter_rows().enumerate() {
             let index = mapping.map_or(i, |m| m[i]);
-            if sens.timestamps.get(index) != Some(&self.timestamps()[i]) {
-                return Err(KernelError::InvalidInput(
-                    "sensitivity and geometry epochs do not match",
+            let sample = SensitivityRow {
+                time: sens.timestamps[index],
+                state: &sens.states[index],
+                stm: &sens.stm[index],
+                state_dcd: sens.state_dcd.get(index),
+            };
+            let (predictions, partial) = self.predict_row::<M>(sample.state, geometry)?;
+            let chained = compose_sample::<M, P>(&partial, &sample);
+            self.write_row(i, &predictions, &chained, output, offset)?;
+        }
+        Ok(())
+    }
+    fn predict_row<const M: usize>(
+        &self,
+        state: &V6,
+        geometry: &StationGeometry,
+    ) -> Result<([f64; M], Matrix<f64, M, 6>)> {
+        let r = r_of(state);
+        let v = v_of(state);
+        let mut predictions = [0.0; M];
+        let mut partial = Matrix::<f64, M, 6>::zeros();
+        if let Some(interferometer) = self.interferometer() {
+            let pred = interferometer.evaluate(state, geometry, 0.0)?;
+            predictions[0] = pred.phase_rad;
+            for k in 0..6 {
+                partial[(0, k)] = pred.partial[(1, k)];
+            }
+        } else if M != 2 {
+            let (rr, h) = range_rate_partial(&r, &v, geometry.position(), geometry.velocity())?;
+            predictions[0] = rr;
+            partial.set_block(0, 0, &h);
+        }
+        if M != 1 {
+            let (angles, h) = az_el_partial_prepared(&r, geometry.position(), geometry.rotation())?;
+            let start = if M == 3 { 1 } else { 0 };
+            predictions[start] = angles[0];
+            predictions[start + 1] = angles[1];
+            partial.set_block(start, 0, &h);
+        }
+        Ok((predictions, partial))
+    }
+    fn write_row<const M: usize, const P: usize>(
+        &self,
+        i: usize,
+        predictions: &[f64; M],
+        chained: &Matrix<f64, M, P>,
+        output: &mut Evaluation,
+        offset: usize,
+    ) -> Result<()> {
+        let n = self.geometry.len();
+        for m in 0..M {
+            let obs = &self.observations()[m];
+            let row = offset + m * n + i;
+            let difference = predictions[m] - obs.values[i];
+            let residual = (if obs.angular {
+                wrap_pi(difference)
+            } else {
+                difference
+            }) / obs.sigma;
+            if !residual.is_finite() {
+                return Err(KernelError::Numerical(
+                    "whitened residual exceeds numeric range",
                 ));
             }
-            let geometry = self.geometry.row(i).expect("validated geometry row");
-            let state = &sens.states[index];
-            let r = r_of(state);
-            let v = v_of(state);
-            let mut predictions = [0.0; M];
-            let mut partial = Matrix::<f64, M, 6>::zeros();
-            if let Some(interferometer) = self.interferometer {
-                let pred = interferometer.evaluate(state, geometry, 0.0)?;
-                predictions[0] = pred.phase_rad;
-                for k in 0..6 {
-                    partial[(0, k)] = pred.partial[(1, k)];
-                }
-            } else if M != 2 {
-                let (rr, h) = range_rate_partial(&r, &v, geometry.position(), geometry.velocity())?;
-                predictions[0] = rr;
-                partial.set_block(0, 0, &h);
-            }
-            if M != 1 {
-                let (angles, h) =
-                    az_el_partial_prepared(&r, geometry.position(), geometry.rotation())?;
-                let start = if M == 3 { 1 } else { 0 };
-                predictions[start] = angles[0];
-                predictions[start + 1] = angles[1];
-                partial.set_block(start, 0, &h);
-            }
-            if !finite(state)
-                || !finite(&sens.stm[index])
-                || (!sens.state_dcd.is_empty() && !finite(&sens.state_dcd[index]))
-            {
-                return Err(KernelError::InvalidInput(
-                    "states and sensitivities must be finite",
-                ));
-            }
-            let mut sensitivity = Matrix::<f64, 6, P>::zeros();
-            sensitivity.set_block(0, 0, &sens.stm[index]);
-            if P == 7 {
-                sensitivity.set_block(0, 6, &sens.state_dcd[index]);
-            }
-            let chained = chain_rule_prevalidated(&partial, &sensitivity);
-            for m in 0..M {
-                let obs = &self.observations[m];
-                let row = offset + m * n + i;
-                let difference = predictions[m] - obs.values[i];
-                let residual = (if obs.angular {
-                    wrap_pi(difference)
-                } else {
-                    difference
-                }) / obs.sigma;
-                if !residual.is_finite() {
-                    return Err(KernelError::InvalidInput(
-                        "whitened residual exceeds numeric range",
+            output.residual[row] = residual;
+            for k in 0..P {
+                let derivative = chained[(m, k)] / obs.sigma;
+                if !derivative.is_finite() {
+                    return Err(KernelError::Numerical(
+                        "whitened Jacobian exceeds numeric range",
                     ));
                 }
-                output.residual[row] = residual;
-                for k in 0..P {
-                    let derivative = chained[(m, k)] / obs.sigma;
-                    if !derivative.is_finite() {
-                        return Err(KernelError::InvalidInput(
-                            "whitened Jacobian exceeds numeric range",
-                        ));
-                    }
-                    output.jacobian[(row, k)] = derivative;
-                }
+                output.jacobian[(row, k)] = derivative;
             }
         }
         Ok(())
     }
+}
+
+fn compose_sample<const M: usize, const P: usize>(
+    partial: &Matrix<f64, M, 6>,
+    sample: &SensitivityRow<'_>,
+) -> Matrix<f64, M, P> {
+    let mut sensitivity = Matrix::<f64, 6, P>::zeros();
+    sensitivity.set_block(0, 0, sample.stm);
+    if let Some(drag) = sample.state_dcd {
+        sensitivity.set_block(0, 6, drag);
+    }
+    chain_rule_prevalidated(partial, &sensitivity)
 }

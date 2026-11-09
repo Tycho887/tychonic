@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 //! Shared, deterministic inputs and dispatch for benchmarks, profiles and stress tests.
 //! This module is deliberately outside the library's public API.
 use std::{hint::black_box, str::FromStr};
@@ -5,7 +6,6 @@ use tychonic::{numeris, satkit};
 
 use numeris::{Matrix, Quaternion};
 use satkit::{Duration, ITRFCoord, Instant, frametransform};
-use std::sync::Arc;
 use tychonic::kernels::*;
 
 pub const SEED: u64 = 0x7479_6368_6f6e_6963;
@@ -249,8 +249,7 @@ pub struct Fixture {
     pub quaternions: Vec<Quaternion<f64>>,
     pub angles: Vec<[f64; 2]>,
     pub local: Vec<V3>,
-    pub prepared_geometry: Arc<PreparedGeometry>,
-    pub batch: PreparedBatch,
+    pub batch: PreparedBatch<'static>,
     pub partials: Vec<Matrix<f64, 3, 6>>,
 }
 impl Fixture {
@@ -259,11 +258,11 @@ impl Fixture {
     /// for a comparison with equivalent whitened residual/Jacobian outputs.
     pub fn reference_evaluation(&self) -> Result<Evaluation> {
         let jac = compute_full_jacobian(&self.sensitivities, &self.station, &self.enu)?;
-        let n = self.sensitivities.states.len();
+        let n = self.sensitivities.states().len();
         let mut residual = numeris::DynVector::zeros(3 * n);
         let mut j = numeris::DynMatrix::zeros(3 * n, 7);
         for i in 0..n {
-            let state = &self.sensitivities.states[i];
+            let state = &self.sensitivities.states()[i];
             let (rr, _) = range_rate_partial(
                 &r_of(state),
                 &v_of(state),
@@ -338,9 +337,9 @@ impl Fixture {
             angles.push([az, el]);
             local.push(los);
         }
-        let prepared_geometry = Arc::new(PreparedGeometry::new(&input.times, &input.sites)?);
+        let prepared_geometry = PreparedGeometry::new(&input.times, &input.sites)?;
         let batch = PreparedBatch::combined(
-            prepared_geometry.clone(),
+            prepared_geometry,
             Observations {
                 range_rate: vec![0.0; n],
                 azimuth: vec![0.0; n],
@@ -369,19 +368,13 @@ impl Fixture {
             partials.push(h);
         }
         Ok(Self {
-            sensitivities: Sensitivities {
-                timestamps: input.times,
-                states,
-                stm,
-                state_dcd,
-            },
+            sensitivities: Sensitivities::new(input.times, states, stm, state_dcd).unwrap(),
             station,
             enu,
             coords,
             quaternions,
             angles,
             local,
-            prepared_geometry,
             batch,
             partials,
         })
@@ -391,7 +384,7 @@ impl Fixture {
 /// Dispatch outside the row loop: the benchmark does not time an enum match per call.
 /// Black-box every result, including Jacobians, so discarded components remain computed.
 pub fn run_scalar(kernel: Kernel, f: &Fixture, rows: usize) -> Result<()> {
-    let n = f.sensitivities.states.len();
+    let n = f.sensitivities.states().len();
     macro_rules! each {
         ($i:ident, $body:expr) => {
             for start in (0..rows).step_by(n) {
@@ -409,8 +402,8 @@ pub fn run_scalar(kernel: Kernel, f: &Fixture, rows: usize) -> Result<()> {
         Kernel::RangeRate => each!(
             i,
             range_rate_partial(
-                &black_box(r_of(&f.sensitivities.states[i])),
-                &black_box(v_of(&f.sensitivities.states[i])),
+                &black_box(r_of(&f.sensitivities.states()[i])),
+                &black_box(v_of(&f.sensitivities.states()[i])),
                 black_box(&f.station.position[i]),
                 black_box(&f.station.velocity[i]),
             )?
@@ -418,7 +411,7 @@ pub fn run_scalar(kernel: Kernel, f: &Fixture, rows: usize) -> Result<()> {
         Kernel::AzEl => each!(
             i,
             az_el_partial(
-                &black_box(r_of(&f.sensitivities.states[i])),
+                &black_box(r_of(&f.sensitivities.states()[i])),
                 black_box(&f.station.position[i]),
                 &black_box(f.enu.east(i)),
                 &black_box(f.enu.north(i)),
@@ -428,7 +421,7 @@ pub fn run_scalar(kernel: Kernel, f: &Fixture, rows: usize) -> Result<()> {
         Kernel::AzElRotation => each!(
             i,
             az_el_partial_with_rotation(
-                &black_box(r_of(&f.sensitivities.states[i])),
+                &black_box(r_of(&f.sensitivities.states()[i])),
                 black_box(&f.station.position[i]),
                 black_box(&f.enu.enu_to_gcrf[i]),
             )?
@@ -460,14 +453,14 @@ pub fn run_scalar(kernel: Kernel, f: &Fixture, rows: usize) -> Result<()> {
         Kernel::InverseRotation => each!(
             i,
             black_box(&f.enu.enu_to_gcrf[i]).transpose()
-                * black_box(r_of(&f.sensitivities.states[i]) - f.station.position[i])
+                * black_box(r_of(&f.sensitivities.states()[i]) - f.station.position[i])
         ),
         Kernel::AzElPrepared => each!(
             i,
             az_el_partial_prepared(
-                &black_box(r_of(&f.sensitivities.states[i])),
+                &black_box(r_of(&f.sensitivities.states()[i])),
                 black_box(&f.station.position[i]),
-                black_box(f.prepared_geometry.row(i).unwrap().rotation())
+                black_box(f.batch.geometry().row(i).unwrap().rotation())
             )?
         ),
         Kernel::LosPrepared => each!(
@@ -475,28 +468,28 @@ pub fn run_scalar(kernel: Kernel, f: &Fixture, rows: usize) -> Result<()> {
             convert_az_el_to_gcrf_prepared(
                 black_box(f.angles[i][0]),
                 black_box(f.angles[i][1]),
-                black_box(f.prepared_geometry.row(i).unwrap().rotation())
+                black_box(f.batch.geometry().row(i).unwrap().rotation())
             )?
         ),
         Kernel::ChainSeparate => each!(i, {
             let h = black_box(&f.partials[i]);
             let rr = h.block::<1, 6>(0, 0);
             let angles = h.block::<2, 6>(1, 0);
-            let phi = black_box(&f.sensitivities.stm[i]);
-            let drag = black_box(&f.sensitivities.state_dcd[i]);
+            let phi = black_box(&f.sensitivities.stm()[i]);
+            let drag = black_box(&f.sensitivities.state_dcd()[i]);
             (rr * phi, rr * drag, angles * phi, angles * drag)
         }),
         Kernel::ChainCombined => each!(i, {
             let h = black_box(&f.partials[i]);
             (
-                h * black_box(&f.sensitivities.stm[i]),
-                h * black_box(&f.sensitivities.state_dcd[i]),
+                h * black_box(&f.sensitivities.stm()[i]),
+                h * black_box(&f.sensitivities.state_dcd()[i]),
             )
         }),
         Kernel::ChainAugmented => each!(i, {
             let mut sensitivity = Matrix::<f64, 6, 7>::zeros();
-            sensitivity.set_block(0, 0, black_box(&f.sensitivities.stm[i]));
-            sensitivity.set_block(0, 6, black_box(&f.sensitivities.state_dcd[i]));
+            sensitivity.set_block(0, 0, black_box(&f.sensitivities.stm()[i]));
+            sensitivity.set_block(0, 6, black_box(&f.sensitivities.state_dcd()[i]));
             black_box(&f.partials[i]) * sensitivity
         }),
         _ => unreachable!("batch kernels use their own dispatch"),

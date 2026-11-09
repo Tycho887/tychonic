@@ -1,15 +1,18 @@
+#![allow(clippy::disallowed_methods)]
+#[path = "support/mod.rs"]
+mod copies;
+use copies::*;
+
 use std::f64::consts::PI;
 
 use numeris::{DynVector, optim::LmSettings};
 use satkit::{Duration, Instant, orbitprop::SatPropertiesSimple};
-use std::sync::Arc;
 use tychonic::{
     kernels::*,
     optim::{CachedProblem, ODProblem, fit_lm},
 };
 
 // Mutable test inputs are deliberately separate from prepared production types.
-#[derive(Clone)]
 struct BatchInput {
     reference_epoch: satkit::Instant,
     t_meas: Vec<satkit::Instant>,
@@ -19,8 +22,21 @@ struct BatchInput {
     settings: satkit::orbitprop::PropSettings,
     delta_cd: f64,
 }
+impl Clone for BatchInput {
+    fn clone(&self) -> Self {
+        Self {
+            reference_epoch: self.reference_epoch,
+            t_meas: self.t_meas.to_vec(),
+            station: copy_station(&self.station),
+            enu: copy_enu(&self.enu),
+            obs: copy_observations(&self.obs),
+            settings: self.settings.clone(),
+            delta_cd: self.delta_cd,
+        }
+    }
+}
 impl BatchInput {
-    fn prepare(&self) -> Result<ODProblem> {
+    fn prepare(&self) -> Result<ODProblem<'static>> {
         if self.t_meas != self.station.timestamps {
             return Err(KernelError::InvalidInput(
                 "geometry and observation epochs do not match",
@@ -35,11 +51,11 @@ impl BatchInput {
                 },
             )?,
             vec![PreparedBatch::combined(
-                Arc::new(PreparedGeometry::from_trajectories(
-                    self.station.clone(),
-                    self.enu.clone(),
-                )?),
-                self.obs.clone(),
+                PreparedGeometry::from_trajectories(
+                    copy_station(&self.station),
+                    copy_enu(&self.enu),
+                )?,
+                copy_observations(&self.obs),
             )?],
         )
     }
@@ -316,12 +332,8 @@ fn identity_stm_and_arbitrary_chain_rule_match_measurement_perturbations() {
     stm[(2, 5)] = -60.0;
     stm[(4, 2)] = 0.001;
     let drag = numeris::vector![100.0, -70.0, 20.0, 0.3, -0.1, 0.2];
-    let sens = Sensitivities {
-        timestamps: problem.t_meas.clone(),
-        states: vec![state],
-        stm: vec![stm],
-        state_dcd: vec![drag],
-    };
+    let sens =
+        Sensitivities::new(problem.t_meas.clone(), vec![state], vec![stm], vec![drag]).unwrap();
     let jac = compute_full_jacobian(&sens, &problem.station, &problem.enu).unwrap();
     let predict = |x: &V6| {
         let (rr, _) = range_rate_partial(
@@ -407,47 +419,50 @@ fn invalid_inputs_epochs_and_dimensions_are_rejected() {
     assert!(p.eval(&truth).is_err());
     let (empty, _) = fixture(&[]);
     assert!(empty.validate().is_err());
-    let sens = Sensitivities {
-        timestamps: problem.t_meas.clone(),
-        states: vec![V6::from_slice(&truth.as_slice()[..6])],
-        stm: vec![],
-        state_dcd: vec![V6::zeros()],
-    };
+    assert!(
+        Sensitivities::new(
+            problem.t_meas.to_vec(),
+            vec![V6::from_slice(&truth.as_slice()[..6])],
+            vec![],
+            vec![V6::zeros()]
+        )
+        .is_err()
+    );
+    let sens = Sensitivities::new(
+        vec![problem.reference_epoch + Duration::from_seconds(0.001)],
+        vec![V6::from_slice(&truth.as_slice()[..6])],
+        vec![M6::eye()],
+        vec![V6::zeros()],
+    )
+    .unwrap();
     assert!(compute_full_jacobian(&sens, &problem.station, &problem.enu).is_err());
-    let mut sens = Sensitivities {
-        timestamps: vec![problem.reference_epoch + Duration::from_seconds(0.001)],
-        states: vec![V6::from_slice(&truth.as_slice()[..6])],
-        stm: vec![M6::eye()],
-        state_dcd: vec![V6::zeros()],
-    };
-    assert!(compute_full_jacobian(&sens, &problem.station, &problem.enu).is_err());
-    sens.stm[0][(0, 0)] = f64::NAN;
-    assert!(sens.augmented_transition(0).is_err());
+    let mut raw = SampleInput::copy_from(&sens);
+    raw.stm[0][(0, 0)] = f64::NAN;
+    assert!(raw.prepare().is_err());
 }
 
 #[test]
-fn cached_evaluations_refresh_for_new_parameters_and_return_shared_values() {
+fn cached_evaluations_refresh_for_new_parameters_and_reuse_owned_buffers() {
     let (input, truth) = fixture(&[0.0]);
-    let cached = CachedProblem::new(input.prepare().unwrap());
+    let mut cached = CachedProblem::new(input.prepare().unwrap());
     let first = cached.evaluate(&truth).unwrap();
-    let second = cached.evaluate(&truth).unwrap();
-    assert!(std::rc::Rc::ptr_eq(&first, &second));
-    let mut copy = (*first).clone();
+    let residual_ptr = first.residual.as_slice().as_ptr();
+    let jacobian_ptr = first.jacobian.as_slice().as_ptr();
+    let mut copy = copy_evaluation(first);
     copy.residual[0] = 100.0;
     copy.jacobian[(0, 0)] = 100.0;
-    assert_eq!(cached.evaluate(&truth).unwrap().residual[0], 0.0);
+    let second = cached.evaluate(&truth).unwrap();
+    assert_eq!(residual_ptr, second.residual.as_slice().as_ptr());
+    assert_eq!(jacobian_ptr, second.jacobian.as_slice().as_ptr());
+    assert_eq!(second.residual[0], 0.0);
     let mut perturbed = truth.clone();
     perturbed[0] += 100.0;
     assert!(cached.evaluate(&perturbed).unwrap().rss() > 0.0);
-    let refreshed = cached.evaluate(&truth).unwrap();
-    assert_eq!(refreshed.rss(), 0.0);
+    assert_eq!(cached.evaluate(&truth).unwrap().rss(), 0.0);
     let mut invalid = truth.clone();
     invalid[6] = f64::NAN;
     assert!(cached.evaluate(&invalid).is_err());
-    assert!(std::rc::Rc::ptr_eq(
-        &refreshed,
-        &cached.evaluate(&truth).unwrap()
-    ));
+    assert_eq!(cached.evaluate(&truth).unwrap().rss(), 0.0);
 }
 
 fn fit(
@@ -464,7 +479,7 @@ fn fit(
     guess[6] += 0.001;
     let problem = problem.prepare().unwrap();
     let initial_rss = problem.evaluate(&guess).unwrap().rss();
-    let result = fit_lm(problem, &guess, None, settings).unwrap();
+    let result = fit_lm(&problem, &guess, None, settings).unwrap();
     assert!(
         result.rss < initial_rss * 0.01,
         "fit did not substantially improve residuals"

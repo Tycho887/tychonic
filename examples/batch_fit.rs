@@ -1,5 +1,5 @@
 //! A noiseless synthetic LEO pass observed by two stations, fitted at the final epoch.
-use std::{error::Error, sync::Arc};
+use std::error::Error;
 
 use numeris::{DynVector, optim::LmSettings};
 use satkit::{Duration, ITRFCoord, TLE, frametransform, orbitprop::SatPropertiesSimple};
@@ -8,6 +8,8 @@ use tychonic::{
     optim::{ODProblem, fit_lm},
 };
 
+// Satkit settings copies are explicit at this external API boundary.
+#[allow(clippy::disallowed_methods)]
 fn main() -> std::result::Result<(), Box<dyn Error>> {
     let tle = TLE::load_2line(
         "1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9009",
@@ -77,7 +79,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
             ParameterMode::StateAndDrag { delta_cd: 1e-4 },
         )?,
         vec![PreparedBatch::combined(
-            Arc::new(PreparedGeometry::from_trajectories(station, enu)?),
+            PreparedGeometry::from_trajectories(station, enu)?,
             obs,
         )?],
     )?;
@@ -98,7 +100,7 @@ fn main() -> std::result::Result<(), Box<dyn Error>> {
         initial.jacobian.ncols()
     );
     let result = fit_lm(
-        problem,
+        &problem,
         &guess,
         None,
         &LmSettings {

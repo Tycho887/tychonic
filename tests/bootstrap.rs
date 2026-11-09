@@ -1,3 +1,8 @@
+#![allow(clippy::disallowed_methods)]
+#[path = "support/mod.rs"]
+mod copies;
+use copies::*;
+
 use numeris::{
     DynMatrix, DynVector,
     optim::{LmSettings, least_squares_lm_dyn},
@@ -105,8 +110,8 @@ fn range_rates_from_state(
         .map(|(i, time)| {
             let row = geometry.row(i).unwrap();
             let (range_rate, _) = range_rate_partial(
-                &r_of(&sensitivities.states[i]),
-                &v_of(&sensitivities.states[i]),
+                &r_of(&sensitivities.states()[i]),
+                &v_of(&sensitivities.states()[i]),
                 row.position(),
                 row.velocity(),
             )
@@ -135,7 +140,7 @@ fn pointing_from_state(
         .map(|(i, time)| {
             let row = geometry.row(i).unwrap();
             let ([azimuth, elevation], _) = az_el_partial_prepared(
-                &r_of(&sensitivities.states[i]),
+                &r_of(&sensitivities.states()[i]),
                 row.position(),
                 row.rotation(),
             )
@@ -191,7 +196,7 @@ fn contact_bias_projection_is_idempotent_and_ignores_pointing_rows() {
             ((row + 1) as f64 * (column as f64 + 0.5)).sin()
         }),
     };
-    let mut projected = original.clone();
+    let mut projected = copy_evaluation(&original);
     map.project(&mut projected).unwrap();
 
     // After projection, every contact's residual and Jacobian column have zero
@@ -215,7 +220,7 @@ fn contact_bias_projection_is_idempotent_and_ignores_pointing_rows() {
     }
 
     // P is idempotent: applying the projector again changes nothing.
-    let mut twice = projected.clone();
+    let mut twice = copy_evaluation(&projected);
     map.project(&mut twice).unwrap();
     for row in 0..rows {
         close(
@@ -405,7 +410,7 @@ fn varpro_multi_contact_fit_matches_the_augmented_joint_lm() {
         max_iter: 100,
         ..LmSettings::default()
     };
-    let fit = fit_varpro(problem.clone(), &guess, None, &settings).unwrap();
+    let fit = fit_varpro(&problem, &guess, None, &settings).unwrap();
     assert!(fit.rss < 1e-8, "reduced RSS {}", fit.rss);
     assert!(fit.iterations > 0);
     let position_error = (0..3)
@@ -608,7 +613,7 @@ fn invalid_inputs_and_insufficient_degrees_of_freedom_are_rejected() {
         sigma_el: 1e-3,
     };
     assert!(matches!(
-        ContactBiasProblem::new(config.clone(), &[], &[], noise),
+        ContactBiasProblem::new(copy_config(&config), &[], &[], noise),
         Err(KernelError::InvalidInput(_))
     ));
 
@@ -706,7 +711,8 @@ fn bootstrap_24_hour_fit_recovers_state_and_drag_from_weak_pointing() {
         sigma_az: 3e-3,
         sigma_el: 3e-3,
     };
-    let problem = ContactBiasProblem::new(config.clone(), &range_rates, &pointing, noise).unwrap();
+    let problem =
+        ContactBiasProblem::new(copy_config(&config), &range_rates, &pointing, noise).unwrap();
     let initial_rss = problem.evaluate_reduced(&old).unwrap().rss();
     let settings = LmSettings {
         grad_tol: 1e-4,

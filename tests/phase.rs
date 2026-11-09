@@ -1,6 +1,10 @@
+#![allow(clippy::disallowed_methods)]
+#[path = "support/mod.rs"]
+mod copies;
+use copies::*;
+
 use numeris::{DynVector, Matrix, Vector, estimate::Ekf, optim::LmSettings};
 use satkit::{Duration, Instant};
-use std::sync::Arc;
 use tychonic::{estimate::*, kernels::*, optim::*};
 
 fn epoch() -> Instant {
@@ -9,21 +13,19 @@ fn epoch() -> Instant {
 fn config(mode: ParameterMode) -> PropagationConfig {
     PropagationConfig::new(epoch(), od_prop_settings(), mode).unwrap()
 }
-fn geometry(times: &[Instant]) -> Arc<PreparedGeometry> {
-    Arc::new(
-        PreparedGeometry::new(
-            times,
-            &vec![
-                GroundStation {
-                    lat_deg: 40.0,
-                    lon_deg: -75.0,
-                    alt_m: 100.0
-                };
-                times.len()
-            ],
-        )
-        .unwrap(),
+fn geometry(times: &[Instant]) -> PreparedGeometry {
+    PreparedGeometry::new(
+        times,
+        &vec![
+            GroundStation {
+                lat_deg: 40.0,
+                lon_deg: -75.0,
+                alt_m: 100.0
+            };
+            times.len()
+        ],
     )
+    .unwrap()
 }
 fn interferometer() -> Interferometer {
     Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9).unwrap()
@@ -144,7 +146,7 @@ fn exact_ou_transition_and_covariance_handle_duplicate_unsorted_times() {
     assert!(c.cholesky().is_ok());
 }
 
-fn fixture(mode: ParameterMode, offsets: &[f64]) -> (PassiveRfProblem, DynVector<f64>) {
+fn fixture(mode: ParameterMode, offsets: &[f64]) -> (PassiveRfProblem<'static>, DynVector<f64>) {
     let times: Vec<_> = offsets
         .iter()
         .map(|dt| epoch() + Duration::from_seconds(*dt))
@@ -165,7 +167,7 @@ fn fixture(mode: ParameterMode, offsets: &[f64]) -> (PassiveRfProblem, DynVector
     let predictions: Vec<_> = (0..times.len())
         .map(|i| {
             interferometer()
-                .evaluate(&s.states[i], g.row(i).unwrap(), 2.0)
+                .evaluate(&s.states()[i], g.row(i).unwrap(), 2.0)
                 .unwrap()
         })
         .collect();
@@ -174,18 +176,16 @@ fn fixture(mode: ParameterMode, offsets: &[f64]) -> (PassiveRfProblem, DynVector
         sigma.push(0.01);
     }
     sigma.extend([10.0, 3.0]);
-    let data = PassiveRfData {
-        geometry: g,
-        interferometer: interferometer(),
-        doppler_hz: predictions.iter().map(|v| v.doppler_hz).collect(),
-        phase_rad: Some(predictions.iter().map(|v| v.phase_rad + 0.7).collect()),
-        sigma_doppler_hz: 0.3,
-        sigma_phase_rad: 0.01,
-    };
-    let prior = RfPrior {
-        mean: parameters.clone(),
-        sigma: DynVector::from_slice(&sigma),
-    };
+    let data = PassiveRfData::new(
+        g,
+        interferometer(),
+        predictions.iter().map(|v| v.doppler_hz).collect(),
+        Some(predictions.iter().map(|v| v.phase_rad + 0.7).collect()),
+        0.3,
+        0.01,
+    )
+    .unwrap();
+    let prior = RfPrior::new(parameters.clone(), DynVector::from_slice(&sigma)).unwrap();
     (
         PassiveRfProblem::new(cfg, data, prior, ou()).unwrap(),
         parameters,
@@ -247,35 +247,34 @@ fn phase_prepared_batch_and_sensor_share_kernel_and_filter_schedule() {
         .config()
         .sample(
             &DynVector::from_slice(&x.as_slice()[..6]),
-            data.geometry.timestamps(),
+            data.geometry().timestamps(),
         )
         .unwrap();
     let phases: Vec<_> = (0..3)
         .map(|i| {
             interferometer()
-                .evaluate(&s.states[i], data.geometry.row(i).unwrap(), 0.0)
+                .evaluate(&s.states()[i], data.geometry().row(i).unwrap(), 0.0)
                 .unwrap()
                 .phase_rad
         })
         .collect();
     let batch =
-        PreparedBatch::phase_difference(data.geometry.clone(), interferometer(), phases, 0.01)
-            .unwrap();
+        PreparedBatch::phase_difference(data.geometry(), interferometer(), phases, 0.01).unwrap();
     let e = batch.evaluate_from_sensitivities(&s).unwrap();
     assert!(e.rss() < 1e-15);
     for i in 0..3 {
         let sensor = PhaseSensor {
-            geometry: data.geometry.row(i).unwrap().clone(),
+            geometry: data.geometry().row(i).unwrap().into(),
             interferometer: interferometer(),
         };
-        let (_, h) = sensor.evaluate(&s.states[i]).unwrap();
-        let chained = h * s.stm[i];
+        let (_, h) = sensor.evaluate(&s.states()[i]).unwrap();
+        let chained = h * s.stm()[i];
         for k in 0..6 {
             assert!((e.jacobian[(i, k)] - chained[(0, k)] / 0.01).abs() < 1e-12);
         }
     }
     let mut filter = OrbitEkf::<6>::new(
-        problem.config().clone(),
+        copy_config(problem.config()),
         V6::from_slice(&x.as_slice()[..6]),
         M6::eye(),
     )
@@ -298,7 +297,7 @@ fn augmented_filter_same_epoch_matches_batch_information_solution() {
     );
     let prior = problem.prior();
     let fit = fit_passive_rf(&problem, &x, &LmSettings::default()).unwrap();
-    let mut filter = PassiveRfEkf::<9>::new(problem.config().clone(), ou(), prior).unwrap();
+    let mut filter = PassiveRfEkf::<9>::new(copy_config(problem.config()), ou(), prior).unwrap();
     filter
         .filter_data(problem.data(), UpdateOptions::default())
         .unwrap();
@@ -319,14 +318,25 @@ fn augmented_filter_same_epoch_matches_batch_information_solution() {
     assert!(filter.predict_to(epoch(), Some(&M6::eye())).is_err());
     assert_eq!(*filter.state(), before);
     assert_eq!(*filter.covariance(), p);
-    let mut bad = problem.data().clone();
-    bad.doppler_hz[0] = f64::NAN;
-    assert!(filter.filter_data(&bad, UpdateOptions::default()).is_err());
+    let data = problem.data();
+    let mut invalid = data.doppler_hz().to_vec();
+    invalid[0] = f64::NAN;
+    assert!(
+        PassiveRfData::new(
+            data.geometry(),
+            data.interferometer(),
+            invalid,
+            data.phase_rad().map(<[f64]>::to_vec),
+            data.sigma_doppler_hz(),
+            data.sigma_phase_rad()
+        )
+        .is_err()
+    );
     assert_eq!(*filter.state(), before);
     let gated = filter
         .update(
             &Vector::from_array([1e9]),
-            problem.data().geometry.row(0).unwrap(),
+            problem.data().geometry().row(0).unwrap(),
             interferometer(),
             &Matrix::new([[1.0]]),
             UpdateOptions { gate: Some(1.0) },
@@ -404,26 +414,32 @@ fn noisy_pass_recovers_offsets_and_supports_augmented_drag() {
     .unwrap();
     assert!(fit.rss < 1e-7);
     let mut filter =
-        PassiveRfEkf::<10>::new(problem.config().clone(), ou(), problem.prior()).unwrap();
+        PassiveRfEkf::<10>::new(copy_config(problem.config()), ou(), problem.prior()).unwrap();
     filter
         .filter_data(problem.data(), UpdateOptions::default())
         .unwrap();
     assert!((filter.state()[6] - x[6]).abs() < 1e-10);
     let smooth = filter.smooth().unwrap();
     assert_eq!(smooth.last().unwrap().0, *filter.state());
-    assert!(PassiveRfEkf::<9>::new(problem.config().clone(), ou(), problem.prior()).is_err());
-    let mut data = problem.data().clone();
-    for i in 0..data.doppler_hz.len() {
-        data.doppler_hz[i] += 0.1 * (i as f64).sin();
-        data.phase_rad.as_mut().unwrap()[i] += 0.001 * (i as f64).cos();
+    assert!(PassiveRfEkf::<9>::new(copy_config(problem.config()), ou(), problem.prior()).is_err());
+    let original = problem.data();
+    let mut doppler = original.doppler_hz().to_vec();
+    let mut phase = original.phase_rad().unwrap().to_vec();
+    for i in 0..doppler.len() {
+        doppler[i] += 0.1 * (i as f64).sin();
+        phase[i] += 0.001 * (i as f64).cos();
     }
-    let noisy = PassiveRfProblem::new(
-        problem.config().clone(),
-        data,
-        problem.prior().clone(),
-        ou(),
+    let data = PassiveRfData::new(
+        original.geometry(),
+        original.interferometer(),
+        doppler,
+        Some(phase),
+        original.sigma_doppler_hz(),
+        original.sigma_phase_rad(),
     )
     .unwrap();
+    let noisy =
+        PassiveRfProblem::new(copy_config(problem.config()), data, problem.prior(), ou()).unwrap();
     let a = fit_passive_rf(
         &noisy,
         &x,

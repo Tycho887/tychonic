@@ -94,7 +94,7 @@ impl Interferometer {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct DifferentialDopplerPrediction {
     pub difference_hz: f64,
     /// Instantaneous derivative with respect to satellite GCRF state.
@@ -142,7 +142,7 @@ pub fn differential_doppler_partial(
     let difference_hz = scale * (rr2 - rr1);
     let partial = (h2 - h1) * scale;
     if !difference_hz.is_finite() || !finite(&partial) || !finite(&baseline_partial) {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "differential Doppler exceeds numeric range",
         ));
     }
@@ -155,7 +155,7 @@ pub fn differential_doppler_partial(
 
 /// Frequency is the Doppler shift relative to the nominal carrier (Hz), avoiding
 /// subtraction of two GHz-sized values. Phase is continuous radians.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct RfPrediction {
     pub doppler_hz: f64,
     pub phase_rad: f64,
@@ -212,7 +212,7 @@ fn phase_partial(
             return Err(KernelError::ZeroRange);
         }
         if !other_range.is_finite() {
-            return Err(KernelError::InvalidInput(
+            return Err(KernelError::Numerical(
                 "antenna 2 range exceeds numeric range",
             ));
         }
@@ -237,7 +237,7 @@ fn phase_partial(
     }
     let phase_rad = k * received_hz * path;
     if !doppler_hz.is_finite() || !phase_rad.is_finite() || !finite(&partial) {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "phase geometry exceeds numeric range",
         ));
     }

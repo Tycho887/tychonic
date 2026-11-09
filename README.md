@@ -5,7 +5,7 @@ Passive orbit determination in Rust using **satkit** for astrodynamics and
 observables and analytic state derivatives, fits batches, and updates an orbit
 as new measurements arrive.
 
-Version **0.9.0** accepts extracted Doppler, phase difference, differential
+Version **0.9.2** accepts extracted Doppler, phase difference, differential
 Doppler, and azimuth/elevation. Each calibrated observable works independently,
 and any combination can be fused with full covariance. Fitting requires an
 initial orbit guess; initialization without one is future work. IQ processing,
@@ -17,7 +17,7 @@ Add tychonic from [crates.io](https://crates.io/crates/tychonic):
 
 ```toml
 [dependencies]
-tychonic = "0.9.0"
+tychonic = "0.9.2"
 ```
 
 See the [API documentation](https://docs.rs/tychonic) for available types and
@@ -27,20 +27,19 @@ versions accepted by the API.
 ## Prepare individual measurements
 
 ```rust,no_run
-use std::sync::Arc;
 use tychonic::{kernels::{GroundStation, Interferometer, PreparedGeometry, v3},
     measurements as m, satkit::Instant};
 
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 let times = vec![Instant::from_unixtime(1704110400.25)];
 let stations = vec![GroundStation { lat_deg: 40.0, lon_deg: -75.0, alt_m: 100.0 }];
-let geometry = Arc::new(PreparedGeometry::new(&times, &stations)?);
+let geometry = PreparedGeometry::new(&times, &stations)?;
 let baseline = Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9)?;
 
-let doppler = m::doppler(geometry.clone(), 2.23e9, vec![-12500.0], 0.5)?;
-let phase = m::phase_difference(geometry.clone(), baseline, vec![12.4], 0.01)?;
-let differential = m::differential_doppler(geometry.clone(), baseline, vec![0.03], 0.7)?;
-let angles = m::azimuth_elevation(geometry, vec![1.2], vec![0.7], 1e-4, 2e-4)?;
+let doppler = m::doppler(&geometry, 2.23e9, vec![-12500.0], 0.5)?;
+let phase = m::phase_difference(&geometry, baseline, vec![12.4], 0.01)?;
+let differential = m::differential_doppler(&geometry, baseline, vec![0.03], 0.7)?;
+let angles = m::azimuth_elevation(&geometry, vec![1.2], vec![0.7], 1e-4, 2e-4)?;
 # Ok(()) }
 ```
 
@@ -65,9 +64,9 @@ to measurement noise and propagation accuracy.
 use tychonic::{OrbitFilter, estimate::UpdateOptions,
     kernels::{PreparedBatch, PropagationConfig, V6, M6}, numeris::DynVector};
 
-fn fit_and_stream(config: PropagationConfig, batches: Vec<PreparedBatch>,
+fn fit_and_stream(config: PropagationConfig, batches: Vec<PreparedBatch<'_>>,
     guess: V6, prior_covariance: M6) -> Result<(), Box<dyn std::error::Error>> {
-    let fit = tychonic::fit(config.clone(), batches.clone(),
+    let fit = tychonic::fit(PropagationConfig::new(config.reference_epoch(), config.settings().clone(), config.mode())?, &batches,
         &DynVector::from_slice(guess.as_slice()))?;
     let mut filter = OrbitFilter::new(config, guess, prior_covariance)?;
     let updates = filter.filter_batches(&batches, |_, _, _| Ok(M6::zeros()),
@@ -158,8 +157,9 @@ is future work. See [the RF setup example](examples/rf_offsets.rs) and
   difference model. Light-time and atmospheric measurement corrections are
   outside the current models.
 
-The original `kernels`, `optim`, and `estimate` APIs remain available. Adding
-`MeasurementKind::Joint` requires updating exhaustive matches in older callers.
+Version 0.9.2 updates ownership and validated-input APIs. See the
+[migration guide](docs/migration_0_9_2.md) and [safety contracts](docs/safety.md).
+`MeasurementKind::Joint` must be handled in exhaustive matches.
 See [the advanced API](docs/advanced_api.md) for propagation limits, prepared
 geometry, variable projection, process noise, and numerical verification, and
 [differential Doppler](docs/differential_doppler.md) for covariance and baselines.

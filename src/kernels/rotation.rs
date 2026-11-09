@@ -2,7 +2,63 @@
 use super::*;
 use numeris::Quaternion;
 use satkit::{ITRFCoord, Instant, frametransform};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
+};
+
+/// Explicit ownership of a prepared schedule. Borrowing never copies its buffers.
+#[derive(Debug)]
+pub enum GeometrySource<'g> {
+    Owned(PreparedGeometry),
+    Borrowed(&'g PreparedGeometry),
+}
+
+impl<'g> From<PreparedGeometry> for GeometrySource<'g> {
+    fn from(value: PreparedGeometry) -> Self {
+        Self::Owned(value)
+    }
+}
+impl<'g> From<&'g PreparedGeometry> for GeometrySource<'g> {
+    fn from(value: &'g PreparedGeometry) -> Self {
+        Self::Borrowed(value)
+    }
+}
+impl Deref for GeometrySource<'_> {
+    type Target = PreparedGeometry;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(value) => value,
+            Self::Borrowed(value) => value,
+        }
+    }
+}
+
+/// An owned station value or a borrow into prepared geometry.
+#[derive(Debug)]
+pub enum StationGeometrySource<'g> {
+    Owned(StationGeometry),
+    Borrowed(&'g StationGeometry),
+}
+impl<'g> From<StationGeometry> for StationGeometrySource<'g> {
+    fn from(value: StationGeometry) -> Self {
+        Self::Owned(value)
+    }
+}
+impl<'g> From<&'g StationGeometry> for StationGeometrySource<'g> {
+    fn from(value: &'g StationGeometry) -> Self {
+        Self::Borrowed(value)
+    }
+}
+impl Deref for StationGeometrySource<'_> {
+    type Target = StationGeometry;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(value) => value,
+            Self::Borrowed(value) => value,
+        }
+    }
+}
 
 /// An orthonormal, right-handed ENU→GCRF rotation, validated once.
 #[derive(Clone, Copy, Debug)]
@@ -31,7 +87,7 @@ impl ValidatedRotation {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct StationGeometry {
     position: V3,
     velocity: V3,
@@ -61,9 +117,19 @@ impl StationGeometry {
     }
 }
 
-/// Immutable geometry shared by observation models. Repeated station/epoch
+/// Immutable geometry shared by observation models.
+///
+/// A borrowed batch cannot outlive its prepared geometry:
+/// ```compile_fail
+/// use tychonic::kernels::{PreparedGeometry, PreparedBatch};
+/// fn dangling_batch() -> PreparedBatch<'static> {
+///     let geometry = PreparedGeometry::new(&[], &[]).unwrap();
+///     PreparedBatch::range_rate(&geometry, vec![], 1.0).unwrap()
+/// }
+/// ```
+/// Repeated station/epoch
 /// rows index the same entry; epochs retain their full `Instant` precision.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PreparedGeometry {
     timestamps: Vec<Instant>,
     stations: Vec<GroundStation>,
@@ -86,6 +152,9 @@ impl PreparedGeometry {
         stations: &[GroundStation],
         mut rotation: impl FnMut(&Instant) -> Quaternion<f64>,
     ) -> Result<Self> {
+        if timestamps.contains(&Instant::INVALID) {
+            return Err(KernelError::InvalidInput("geometry epochs must be valid"));
+        }
         if timestamps.len() != stations.len() {
             return Err(KernelError::InvalidInput("expected one station per epoch"));
         }
@@ -94,68 +163,15 @@ impl PreparedGeometry {
         // maintaining two redundant lookup tables for this common OD schedule.
         let unique_epochs = timestamps.windows(2).all(|w| w[0] < w[1])
             || timestamps.windows(2).all(|w| w[0] > w[1]);
-        let mut fixed = HashMap::with_capacity(initial_capacity);
-        // Instant's raw value is its exact TAI microsecond count, not a rounded
-        // floating-point epoch. Hashing it preserves Instant equality exactly.
-        let cache_capacity = if unique_epochs { 0 } else { initial_capacity };
-        let mut epochs = HashMap::with_capacity(cache_capacity);
-        let mut pairs = HashMap::with_capacity(cache_capacity);
-        let mut entries = Vec::with_capacity(if unique_epochs {
-            timestamps.len()
-        } else {
-            initial_capacity
-        });
+        let mut cache = GeometryCache::new(unique_epochs, timestamps.len(), initial_capacity);
         let mut rows = Vec::with_capacity(timestamps.len());
-        let omega = v3(0.0, 0.0, satkit::consts::OMEGA_EARTH);
-        for (t, station) in timestamps.iter().zip(stations) {
-            let key = station_key(station);
-            let station_index = fixed.len();
-            let (station_index, r, v, enu) = *match fixed.entry(key) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let coord = station_coord(station.lat_deg, station.lon_deg, station.alt_m)?;
-                    let radius = coord.itrf.norm();
-                    if !finite(&coord.itrf) || !radius.is_finite() || radius == 0.0 {
-                        return Err(KernelError::InvalidInput("invalid station ITRF position"));
-                    }
-                    e.insert((
-                        station_index,
-                        coord.itrf,
-                        omega.cross(&coord.itrf),
-                        coord.q_enu2itrf(),
-                    ))
-                }
-            };
-            if unique_epochs {
-                let q = rotation(t);
-                rows.push(entries.len());
-                entries.push(StationGeometry::new(
-                    q * r,
-                    q * v,
-                    (q * enu).to_rotation_matrix(),
-                )?);
-                continue;
-            }
-            let index = match pairs.entry((t.raw, station_index)) {
-                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let q = *epochs.entry(t.raw).or_insert_with(|| rotation(t));
-                    let index = entries.len();
-                    entries.push(StationGeometry::new(
-                        q * r,
-                        q * v,
-                        (q * enu).to_rotation_matrix(),
-                    )?);
-                    e.insert(index);
-                    index
-                }
-            };
-            rows.push(index);
+        for (time, station) in timestamps.iter().zip(stations) {
+            rows.push(cache.add(time, station, &mut rotation)?);
         }
         Ok(Self {
             timestamps: timestamps.to_vec(),
             stations: stations.to_vec(),
-            entries,
+            entries: cache.entries,
             rows,
         })
     }
@@ -163,6 +179,9 @@ impl PreparedGeometry {
     /// Checked import of externally computed states/rotations. Inputs are
     /// consumed so subsequent mutation cannot invalidate this geometry.
     pub fn from_trajectories(station: GCRFTrajectory, enu: EnuBasisTrajectory) -> Result<Self> {
+        if station.timestamps.contains(&Instant::INVALID) {
+            return Err(KernelError::InvalidInput("geometry epochs must be valid"));
+        }
         let n = station.timestamps.len();
         if station.position.len() != n
             || station.velocity.len() != n
@@ -211,6 +230,101 @@ impl PreparedGeometry {
     pub fn row(&self, i: usize) -> Option<&StationGeometry> {
         self.rows.get(i).map(|&index| &self.entries[index])
     }
+
+    /// Rows in caller order, including repeated station/epoch pairs.
+    /// Constructors insert each entry before its index, and fields are private.
+    pub fn iter_rows(&self) -> impl ExactSizeIterator<Item = &StationGeometry> {
+        self.rows.iter().map(|&index| &self.entries[index])
+    }
+}
+
+type FixedStation = (usize, V3, V3, Quaternion<f64>);
+// Temporary construction state; the immutable geometry retains only entries
+// and row indices after the schedule has been prepared.
+struct GeometryCache {
+    unique_epochs: bool,
+    fixed: HashMap<StationKey, FixedStation>,
+    epochs: HashMap<i64, Quaternion<f64>>,
+    pairs: HashMap<(i64, usize), usize>,
+    entries: Vec<StationGeometry>,
+}
+
+impl GeometryCache {
+    fn new(unique_epochs: bool, rows: usize, initial_capacity: usize) -> Self {
+        let capacity = if unique_epochs { 0 } else { initial_capacity };
+        Self {
+            unique_epochs,
+            fixed: HashMap::with_capacity(initial_capacity),
+            epochs: HashMap::with_capacity(capacity),
+            pairs: HashMap::with_capacity(capacity),
+            entries: Vec::with_capacity(if unique_epochs {
+                rows
+            } else {
+                initial_capacity
+            }),
+        }
+    }
+
+    fn add(
+        &mut self,
+        time: &Instant,
+        station: &GroundStation,
+        rotation: &mut impl FnMut(&Instant) -> Quaternion<f64>,
+    ) -> Result<usize> {
+        let omega = v3(0.0, 0.0, satkit::consts::OMEGA_EARTH);
+        let (station_index, r, v, enu) = fixed_station(&mut self.fixed, station, &omega)?;
+        if self.unique_epochs {
+            let q = rotation(time);
+            let index = self.entries.len();
+            self.entries.push(StationGeometry::new(
+                q * r,
+                q * v,
+                (q * enu).to_rotation_matrix(),
+            )?);
+            return Ok(index);
+        }
+        match self.pairs.entry((time.raw, station_index)) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(*e.get()),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let q = *self
+                    .epochs
+                    .entry(time.raw)
+                    .or_insert_with(|| rotation(time));
+                let index = self.entries.len();
+                self.entries.push(StationGeometry::new(
+                    q * r,
+                    q * v,
+                    (q * enu).to_rotation_matrix(),
+                )?);
+                e.insert(index);
+                Ok(index)
+            }
+        }
+    }
+}
+
+fn fixed_station(
+    fixed: &mut HashMap<StationKey, FixedStation>,
+    station: &GroundStation,
+    omega: &V3,
+) -> Result<FixedStation> {
+    let station_index = fixed.len();
+    match fixed.entry(station_key(station)) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(*entry.get()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let coord = station_coord(station.lat_deg, station.lon_deg, station.alt_m)?;
+            let radius = coord.itrf.norm();
+            if !finite(&coord.itrf) || !radius.is_finite() || radius == 0.0 {
+                return Err(KernelError::InvalidInput("invalid station ITRF position"));
+            }
+            Ok(*entry.insert((
+                station_index,
+                coord.itrf,
+                omega.cross(&coord.itrf),
+                coord.q_enu2itrf(),
+            )))
+        }
+    }
 }
 
 fn station_coord(lat_deg: f64, lon_deg: f64, alt_m: f64) -> Result<ITRFCoord> {
@@ -226,7 +340,7 @@ fn station_coord(lat_deg: f64, lon_deg: f64, alt_m: f64) -> Result<ITRFCoord> {
     Ok(ITRFCoord::from_geodetic_deg(lat_deg, lon_deg, alt_m))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct GCRFTrajectory {
     /// Exact observation epochs, including fractional seconds.
     pub timestamps: Vec<Instant>,
@@ -236,7 +350,7 @@ pub struct GCRFTrajectory {
     pub velocity: Vec<V3>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct EnuBasisTrajectory {
     pub timestamps: Vec<Instant>,
     /// R_i = R_ITRF→GCRF(t_i) R_ENU→ITRF(lat_i, lon_i).
@@ -293,6 +407,9 @@ fn precompute_station_geometry_with_rotation(
     stations: &[GroundStation],
     mut rotation: impl FnMut(&Instant) -> Quaternion<f64>,
 ) -> Result<(GCRFTrajectory, EnuBasisTrajectory)> {
+    if timestamps.contains(&Instant::INVALID) {
+        return Err(KernelError::InvalidInput("geometry epochs must be valid"));
+    }
     if timestamps.len() != stations.len() {
         return Err(KernelError::InvalidInput(
             "expected one ground station per measurement epoch",
@@ -381,17 +498,13 @@ pub fn compute_enu_basis(
 }
 
 pub(super) fn check_basis(e: &V3, n: &V3, u: &V3) -> Result<()> {
-    if !finite(e)
-        || !finite(n)
-        || !finite(u)
-        || (e.norm() - 1.0).abs() > 1e-10
-        || (n.norm() - 1.0).abs() > 1e-10
-        || (u.norm() - 1.0).abs() > 1e-10
-        || e.dot(n).abs() > 1e-10
-        || e.dot(u).abs() > 1e-10
-        || n.dot(u).abs() > 1e-10
-        || (e.cross(n) - u).norm() > 1e-10
-    {
+    let invalid_axis = [e, n, u]
+        .iter()
+        .any(|axis| !finite(axis) || (axis.norm() - 1.0).abs() > 1e-10);
+    let nonorthogonal = [e.dot(n), e.dot(u), n.dot(u)]
+        .iter()
+        .any(|dot| dot.abs() > 1e-10);
+    if invalid_axis || nonorthogonal || (e.cross(n) - u).norm() > 1e-10 {
         return Err(KernelError::InvalidInput(
             "ENU basis must be finite, orthonormal and right-handed",
         ));
@@ -401,6 +514,9 @@ pub(super) fn check_basis(e: &V3, n: &V3, u: &V3) -> Result<()> {
 
 /// Unit line of sight using the same approximate frame chain as station/ENU.
 pub fn convert_az_el_to_gcrf(az: f64, el: f64, coord: &ITRFCoord, time: &Instant) -> Result<V3> {
+    if *time == Instant::INVALID {
+        return Err(KernelError::InvalidInput("LOS epoch must be valid"));
+    }
     if !az.is_finite()
         || !el.is_finite()
         || !(-PI / 2.0..=PI / 2.0).contains(&el)

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use std::f64::consts::PI;
 
 use numeris::Quaternion;

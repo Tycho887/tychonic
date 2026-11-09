@@ -1,5 +1,6 @@
 //! Bias-aware RF EKF. Layout: orbit (6, or 7 including drag), frequency
 //! offset (Hz), unknown hardware phase mean (rad), stationary OU drift (rad).
+use super::FilterHistory;
 use super::{EkfResult, SmoothedOrbit, UpdateOptions, UpdateResult, ekf::check_covariance};
 use crate::{
     kernels::*,
@@ -20,7 +21,7 @@ pub struct PassiveRfEkf<const N: usize> {
     epoch: Instant,
     filter: Ekf<f64, N, 1>,
     timestamps: Vec<Instant>,
-    steps: Vec<EkfStep<f64, N>>,
+    steps: FilterHistory<N>,
     has_baseline: bool,
     has_differential_baseline: bool,
 }
@@ -89,7 +90,7 @@ impl<const N: usize> PassiveRfEkf<N> {
             epoch,
             filter: Ekf::new(x, covariance),
             timestamps: vec![epoch],
-            steps: vec![record(x, covariance, Matrix::eye())],
+            steps: FilterHistory::new(record(x, covariance, Matrix::eye())),
             has_baseline: baseline_sigma_m.is_some(),
             has_differential_baseline: differential_baseline_sigma_m.is_some(),
         })
@@ -106,11 +107,11 @@ impl<const N: usize> PassiveRfEkf<N> {
     pub fn timestamps(&self) -> &[Instant] {
         &self.timestamps
     }
-    pub fn steps(&self) -> &[EkfStep<f64, N>] {
+    pub fn steps(&self) -> &FilterHistory<N> {
         &self.steps
     }
     pub fn smooth(&self) -> EkfResult<SmoothedOrbit<N>> {
-        Ok(rts_smooth(&self.steps)?)
+        Ok(rts_smooth(&self.steps.to_records())?)
     }
 
     /// Deterministic orbital dynamics and exact OU discretization. Optional
@@ -220,15 +221,47 @@ impl<const N: usize> PassiveRfEkf<N> {
             return Err(KernelError::InvalidInput("RF sensor dimension, reading or gate").into());
         }
         check_covariance(covariance, true)?;
-        if differential_interferometer
-            .is_some_and(|int| int.carrier_hz() != interferometer.carrier_hz())
-            || (M == 3 && self.has_differential_baseline && differential_interferometer.is_none())
-        {
-            return Err(KernelError::InvalidInput(
-                "separate differential geometry/carrier mismatch",
-            )
-            .into());
+        check_differential_sensor::<M>(
+            interferometer,
+            differential_interferometer,
+            self.has_differential_baseline,
+        )?;
+        let p = self.config.mode().columns();
+        let (innovation, h) = self.measurement_innovation(
+            observed,
+            geometry,
+            interferometer,
+            differential_interferometer,
+        )?;
+        let mut candidate = Ekf::<f64, N, M>::new(self.filter.x, self.filter.p);
+        let nis = candidate.update(&innovation, |_| Vector::zeros(), |_| h, covariance)?;
+        if !nis.is_finite() {
+            return Err(KernelError::Numerical("RF innovation exceeds numeric range").into());
         }
+        let accepted = options.gate.is_none_or(|g| nis <= g);
+        if accepted {
+            validate_state(&candidate.x, p)?;
+            check_covariance(&candidate.p, true)?;
+            self.filter.x = candidate.x;
+            self.filter.p = candidate.p;
+            let last = self.steps.current_mut();
+            last.x_updated = candidate.x;
+            last.p_updated = candidate.p;
+        }
+        Ok(UpdateResult {
+            innovation,
+            nis,
+            accepted,
+        })
+    }
+
+    fn measurement_innovation<const M: usize>(
+        &self,
+        observed: &Vector<f64, M>,
+        geometry: &StationGeometry,
+        interferometer: Interferometer,
+        differential_interferometer: Option<Interferometer>,
+    ) -> Result<(Vector<f64, M>, Matrix<f64, M, N>)> {
         let p = self.config.mode().columns();
         let interferometer = if self.has_baseline {
             interferometer.corrected(&v3(
@@ -251,6 +284,36 @@ impl<const N: usize> PassiveRfEkf<N> {
             h[(0, j)] = pred.partial[(0, j)];
         }
         h[(0, p)] = 1.0;
+        self.add_phase(observed, geometry, &pred, &mut innovation, &mut h);
+        self.add_differential(
+            observed,
+            geometry,
+            interferometer,
+            differential_interferometer,
+            &mut innovation,
+            &mut h,
+        )?;
+        if !innovation
+            .as_slice()
+            .iter()
+            .chain(h.as_slice())
+            .all(|v| v.is_finite())
+        {
+            return Err(KernelError::Numerical(
+                "RF innovation or partials exceed numeric range",
+            ));
+        }
+        Ok((innovation, h))
+    }
+    fn add_phase<const M: usize>(
+        &self,
+        observed: &Vector<f64, M>,
+        geometry: &StationGeometry,
+        pred: &RfPrediction,
+        innovation: &mut Vector<f64, M>,
+        h: &mut Matrix<f64, M, N>,
+    ) {
+        let p = self.config.mode().columns();
         if M >= 2 {
             innovation[1] =
                 observed[1] - pred.phase_rad - self.filter.x[p + 1] - self.filter.x[p + 2];
@@ -267,6 +330,17 @@ impl<const N: usize> PassiveRfEkf<N> {
                 }
             }
         }
+    }
+    fn add_differential<const M: usize>(
+        &self,
+        observed: &Vector<f64, M>,
+        geometry: &StationGeometry,
+        interferometer: Interferometer,
+        differential_interferometer: Option<Interferometer>,
+        innovation: &mut Vector<f64, M>,
+        h: &mut Matrix<f64, M, N>,
+    ) -> Result<()> {
+        let p = self.config.mode().columns();
         if M == 3 {
             let mut differential_int = differential_interferometer.unwrap_or(interferometer);
             let column = if self.has_differential_baseline {
@@ -277,7 +351,7 @@ impl<const N: usize> PassiveRfEkf<N> {
                 None
             };
             if self.has_differential_baseline {
-                let k = column.unwrap();
+                let k = p + 3 + 3 * usize::from(self.has_baseline);
                 differential_int = differential_int.corrected(&v3(
                     self.filter.x[k],
                     self.filter.x[k + 1],
@@ -299,28 +373,8 @@ impl<const N: usize> PassiveRfEkf<N> {
                 }
             }
         }
-        let mut candidate = Ekf::<f64, N, M>::new(self.filter.x, self.filter.p);
-        let nis = candidate.update(&innovation, |_| Vector::zeros(), |_| h, covariance)?;
-        if !nis.is_finite() {
-            return Err(KernelError::InvalidInput("RF innovation exceeds numeric range").into());
-        }
-        let accepted = options.gate.is_none_or(|g| nis <= g);
-        if accepted {
-            validate_state(&candidate.x, p)?;
-            check_covariance(&candidate.p, true)?;
-            self.filter.x = candidate.x;
-            self.filter.p = candidate.p;
-            let last = self.steps.last_mut().unwrap();
-            last.x_updated = candidate.x;
-            last.p_updated = candidate.p;
-        }
-        Ok(UpdateResult {
-            innovation,
-            nis,
-            accepted,
-        })
+        Ok(())
     }
-
     /// Sort exact epochs stably. On a failed reading roll back its prediction;
     /// earlier successful readings remain committed.
     pub fn filter_data(
@@ -336,14 +390,7 @@ impl<const N: usize> PassiveRfEkf<N> {
         differential: Option<&DifferentialDopplerData>,
         options: UpdateOptions,
     ) -> EkfResult<Vec<(f64, bool)>> {
-        self.filter_data_with_extensions(
-            data,
-            &RfExtensions {
-                differential_doppler: differential.cloned(),
-                ..RfExtensions::default()
-            },
-            options,
-        )
+        self.filter_data_borrowed(data, differential, None, options)
     }
     pub fn filter_data_with_extensions(
         &mut self,
@@ -351,8 +398,21 @@ impl<const N: usize> PassiveRfEkf<N> {
         extensions: &RfExtensions,
         options: UpdateOptions,
     ) -> EkfResult<Vec<(f64, bool)>> {
+        self.filter_data_borrowed(
+            data,
+            extensions.differential_doppler.as_ref(),
+            extensions.differential_interferometer,
+            options,
+        )
+    }
+    fn filter_data_borrowed(
+        &mut self,
+        data: &PassiveRfData,
+        differential: Option<&DifferentialDopplerData>,
+        differential_interferometer: Option<Interferometer>,
+        options: UpdateOptions,
+    ) -> EkfResult<Vec<(f64, bool)>> {
         data.validate()?;
-        let differential = extensions.differential_doppler.as_ref();
         if let Some(dd) = differential {
             dd.validate(data)?;
         }
@@ -363,58 +423,86 @@ impl<const N: usize> PassiveRfEkf<N> {
         }
         let mut results = Vec::with_capacity(order.len());
         for i in order {
-            let saved = (self.filter.x, self.filter.p, self.epoch, self.steps.len());
+            let saved = (
+                self.filter.x,
+                self.filter.p,
+                self.epoch,
+                self.steps.checkpoint(),
+            );
             self.predict_to(data.geometry.timestamps()[i], None)?;
-            let g = data.geometry.row(i).unwrap();
-            let result = if let Some(dd) = differential {
-                self.update_with_differential_baseline(
-                    &Vector::from_array([
-                        data.doppler_hz[i],
-                        data.phase_rad.as_ref().unwrap()[i],
-                        dd.difference_hz[i],
-                    ]),
-                    g,
-                    data.interferometer,
-                    extensions.differential_interferometer,
-                    &dd.covariance(data),
-                    options,
-                )
-                .map(|r| (r.nis, r.accepted))
-            } else if let Some(phase) = &data.phase_rad {
-                self.update(
-                    &Vector::from_array([data.doppler_hz[i], phase[i]]),
-                    g,
-                    data.interferometer,
-                    &Matrix::new([
-                        [data.sigma_doppler_hz.powi(2), 0.0],
-                        [0.0, data.sigma_phase_rad.powi(2)],
-                    ]),
-                    options,
-                )
-                .map(|r| (r.nis, r.accepted))
-            } else {
-                self.update(
-                    &Vector::from_array([data.doppler_hz[i]]),
-                    g,
-                    data.interferometer,
-                    &Matrix::new([[data.sigma_doppler_hz.powi(2)]]),
-                    options,
-                )
-                .map(|r| (r.nis, r.accepted))
-            };
+            let g = data
+                .geometry
+                .row(i)
+                .ok_or(KernelError::InvalidInput("RF geometry row"))?;
+            let result = self.update_data_row(
+                i,
+                data,
+                differential,
+                differential_interferometer,
+                g,
+                options,
+            );
             match result {
                 Ok(r) => results.push(r),
                 Err(e) => {
                     self.filter.x = saved.0;
                     self.filter.p = saved.1;
                     self.epoch = saved.2;
-                    self.steps.truncate(saved.3);
-                    self.timestamps.truncate(saved.3);
+                    self.steps.restore(saved.3);
+                    self.timestamps.truncate(self.steps.len());
                     return Err(e);
                 }
             }
         }
         Ok(results)
+    }
+    fn update_data_row(
+        &mut self,
+        i: usize,
+        data: &PassiveRfData,
+        differential: Option<&DifferentialDopplerData>,
+        differential_interferometer: Option<Interferometer>,
+        g: &StationGeometry,
+        options: UpdateOptions,
+    ) -> EkfResult<(f64, bool)> {
+        if let Some(dd) = differential {
+            self.update_with_differential_baseline(
+                &Vector::from_array([
+                    data.doppler_hz[i],
+                    data.phase_rad.as_ref().ok_or(KernelError::InvalidInput(
+                        "differential RF data requires phase",
+                    ))?[i],
+                    dd.difference_hz[i],
+                ]),
+                g,
+                data.interferometer,
+                differential_interferometer,
+                &dd.covariance(data),
+                options,
+            )
+            .map(|r| (r.nis, r.accepted))
+        } else if let Some(phase) = &data.phase_rad {
+            self.update(
+                &Vector::from_array([data.doppler_hz[i], phase[i]]),
+                g,
+                data.interferometer,
+                &Matrix::new([
+                    [data.sigma_doppler_hz.powi(2), 0.0],
+                    [0.0, data.sigma_phase_rad.powi(2)],
+                ]),
+                options,
+            )
+            .map(|r| (r.nis, r.accepted))
+        } else {
+            self.update(
+                &Vector::from_array([data.doppler_hz[i]]),
+                g,
+                data.interferometer,
+                &Matrix::new([[data.sigma_doppler_hz.powi(2)]]),
+                options,
+            )
+            .map(|r| (r.nis, r.accepted))
+        }
     }
 }
 
@@ -443,4 +531,20 @@ fn record<const N: usize>(
         p_updated: p,
         f_jacobian: f,
     }
+}
+
+fn check_differential_sensor<const M: usize>(
+    interferometer: Interferometer,
+    differential_interferometer: Option<Interferometer>,
+    has_differential_baseline: bool,
+) -> EkfResult<()> {
+    if differential_interferometer
+        .is_some_and(|int| int.carrier_hz() != interferometer.carrier_hz())
+        || (M == 3 && has_differential_baseline && differential_interferometer.is_none())
+    {
+        return Err(
+            KernelError::InvalidInput("separate differential geometry/carrier mismatch").into(),
+        );
+    }
+    Ok(())
 }

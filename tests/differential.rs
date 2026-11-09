@@ -1,6 +1,10 @@
+#![allow(clippy::disallowed_methods)]
+#[path = "support/mod.rs"]
+mod copies;
+use copies::*;
+
 use numeris::{DynVector, Matrix, Vector, optim::LmSettings};
 use satkit::{Duration, Instant};
-use std::sync::Arc;
 use tychonic::{estimate::*, kernels::*, optim::*};
 
 fn epoch() -> Instant {
@@ -8,7 +12,7 @@ fn epoch() -> Instant {
 }
 fn setup() -> (
     PropagationConfig,
-    Arc<PreparedGeometry>,
+    PreparedGeometry,
     V6,
     Interferometer,
     RfPrior,
@@ -17,20 +21,18 @@ fn setup() -> (
         .iter()
         .map(|dt| epoch() + Duration::from_seconds(*dt))
         .collect();
-    let g = Arc::new(
-        PreparedGeometry::new(
-            &times,
-            &vec![
-                GroundStation {
-                    lat_deg: 40.0,
-                    lon_deg: -75.0,
-                    alt_m: 100.0
-                };
-                times.len()
-            ],
-        )
-        .unwrap(),
-    );
+    let g = PreparedGeometry::new(
+        &times,
+        &vec![
+            GroundStation {
+                lat_deg: 40.0,
+                lon_deg: -75.0,
+                alt_m: 100.0
+            };
+            times.len()
+        ],
+    )
+    .unwrap();
     let row = g.row(0).unwrap();
     let x = v6_from(
         &(row.position() + row.rotation().to_gcrf(&v3(50e3, 80e3, 400e3))),
@@ -38,10 +40,11 @@ fn setup() -> (
     );
     let mut mean = x.as_slice().to_vec();
     mean.extend([2.0, 0.7]);
-    let prior = RfPrior {
-        mean: DynVector::from_slice(&mean),
-        sigma: DynVector::from_slice(&[1000.0, 1000.0, 1000.0, 1.0, 1.0, 1.0, 10.0, 3.0]),
-    };
+    let prior = RfPrior::new(
+        DynVector::from_slice(&mean),
+        DynVector::from_slice(&[1000.0, 1000.0, 1000.0, 1.0, 1.0, 1.0, 10.0, 3.0]),
+    )
+    .unwrap();
     (
         PropagationConfig::new(
             epoch(),
@@ -65,7 +68,7 @@ fn exact_differential_state_and_baseline_jacobians_match_central_differences() {
     for i in 0..g.len() {
         let row = g.row(i).unwrap();
         let t = g.timestamps()[i];
-        let x = s.states[i];
+        let x = s.states()[i];
         let predicted = interferometer.differential(&x, row, t).unwrap();
         for k in 0..6 {
             let step = if k < 3 { 5.0 } else { 1.0 };
@@ -169,14 +172,15 @@ fn zero_baseline_cancellation_and_shared_noise_covariance() {
         .unwrap();
     assert_eq!(zero.difference_hz, 0.0);
     assert_eq!(zero.partial, Matrix::<f64, 1, 6>::zeros());
-    let data = PassiveRfData {
-        geometry: g,
-        interferometer: Interferometer::new(V3::zeros(), 2.23e9).unwrap(),
-        doppler_hz: vec![0.0; 3],
-        phase_rad: Some(vec![0.0; 3]),
-        sigma_doppler_hz: 0.3,
-        sigma_phase_rad: 0.1,
-    };
+    let data = PassiveRfData::new(
+        g,
+        Interferometer::new(V3::zeros(), 2.23e9).unwrap(),
+        vec![0.0; 3],
+        Some(vec![0.0; 3]),
+        0.3,
+        0.1,
+    )
+    .unwrap();
     let dd = DifferentialDopplerData {
         difference_hz: vec![0.0; 3],
         sigma_antenna2_hz: 0.4,
@@ -191,17 +195,27 @@ fn zero_baseline_cancellation_and_shared_noise_covariance() {
         (rss - (0.2_f64 / 0.3).powi(2) - (0.05_f64 / 0.1).powi(2) - (-0.1_f64 / 0.4).powi(2)).abs()
             < 1e-12
     );
-    let mut invalid = dd.clone();
+    let mut invalid = DifferentialDopplerData {
+        difference_hz: dd.difference_hz.to_vec(),
+        sigma_antenna2_hz: dd.sigma_antenna2_hz,
+    };
     invalid.sigma_antenna2_hz = 0.0;
     assert!(invalid.validate(&data).is_err());
-    let mut no_phase = data.clone();
-    no_phase.phase_rad = None;
+    let no_phase = PassiveRfData::new(
+        data.geometry(),
+        data.interferometer(),
+        data.doppler_hz().to_vec(),
+        None,
+        data.sigma_doppler_hz(),
+        data.sigma_phase_rad(),
+    )
+    .unwrap();
     assert!(dd.validate(&no_phase).is_err());
     assert!(
         differential_doppler_partial(
             &x,
-            data.geometry.row(0).unwrap().position(),
-            data.geometry.row(0).unwrap().velocity(),
+            data.geometry().row(0).unwrap().position(),
+            data.geometry().row(0).unwrap().velocity(),
             &V3::zeros(),
             &v3(f64::NAN, 0.0, 0.0),
             2.23e9
@@ -213,12 +227,13 @@ fn zero_baseline_cancellation_and_shared_noise_covariance() {
 #[test]
 fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
     let (original, _) = problem(false);
-    let mut mean = original.prior().mean.as_slice()[..6].to_vec();
+    let mut mean = original.prior().mean().as_slice()[..6].to_vec();
     mean.extend([0.02, 2.0, 0.7]);
-    let prior = RfPrior {
-        mean: DynVector::from_slice(&mean),
-        sigma: DynVector::from_slice(&[1000.0, 1000.0, 1000.0, 1.0, 1.0, 1.0, 0.01, 10.0, 3.0]),
-    };
+    let prior = RfPrior::new(
+        DynVector::from_slice(&mean),
+        DynVector::from_slice(&[1000.0, 1000.0, 1000.0, 1.0, 1.0, 1.0, 0.01, 10.0, 3.0]),
+    )
+    .unwrap();
     let cfg = PropagationConfig::new(
         epoch(),
         od_prop_settings(),
@@ -227,11 +242,11 @@ fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
     .unwrap();
     let ou = OuPhaseNoise::new(21600.0, 0.087).unwrap();
     let problem = PassiveRfProblem::new_extended(
-        cfg.clone(),
-        original.data().clone(),
-        prior.clone(),
+        copy_config(&cfg),
+        original.data(),
+        &prior,
         ou,
-        original.extensions().clone(),
+        original.extensions(),
     )
     .unwrap();
     assert_eq!(problem.columns(), 12);
@@ -250,13 +265,14 @@ fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
     assert!(e.rss() < 1e-12);
     let (first, second) = polar_sites();
     let remote = Interferometer::new(first.baseline_enu_to(&second).unwrap(), 2.23e9).unwrap();
-    let times = problem.data().geometry.timestamps();
+    let times = problem.data().geometry().timestamps();
     let states = problem
         .config()
-        .sample(&DynVector::from_slice(&prior.mean.as_slice()[..7]), times)
+        .sample(&DynVector::from_slice(&prior.mean().as_slice()[..7]), times)
         .unwrap()
-        .states;
-    let mut ext = problem.extensions().clone();
+        .states()
+        .to_vec();
+    let mut ext = copy_extensions(problem.extensions());
     ext.differential_interferometer = Some(remote);
     ext.differential_baseline_sigma_m = Some(v3(0.005, 0.005, 0.005));
     ext.differential_doppler.as_mut().unwrap().difference_hz = states
@@ -264,17 +280,17 @@ fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
         .enumerate()
         .map(|(i, x)| {
             remote
-                .differential(x, problem.data().geometry.row(i).unwrap(), times[i])
+                .differential(x, problem.data().geometry().row(i).unwrap(), times[i])
                 .unwrap()
                 .difference_hz
         })
         .collect();
     let combined = PassiveRfProblem::new_extended(
-        problem.config().clone(),
-        problem.data().clone(),
-        prior.clone(),
+        copy_config(problem.config()),
+        problem.data(),
+        &prior,
         ou,
-        ext.clone(),
+        &ext,
     )
     .unwrap();
     assert_eq!(combined.columns(), 15);
@@ -286,7 +302,7 @@ fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
             < 1e-12
     );
     let mut f = PassiveRfEkf::<16>::new_with_calibration(
-        combined.config().clone(),
+        copy_config(combined.config()),
         ou,
         &prior,
         ext.baseline_sigma_m,
@@ -298,35 +314,39 @@ fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
     assert!(f.smooth().is_ok());
 }
 
-fn problem(same_epoch: bool) -> (PassiveRfProblem, DynVector<f64>) {
+fn problem(same_epoch: bool) -> (PassiveRfProblem<'static>, DynVector<f64>) {
     let (cfg, mut g, x, int, prior) = setup();
     if same_epoch {
-        g = Arc::new(PreparedGeometry::new(&[epoch(); 3], &[g.stations()[0]; 3]).unwrap());
+        g = PreparedGeometry::new(&[epoch(); 3], &[g.stations()[0]; 3]).unwrap();
     }
     let s = cfg
         .sample(&DynVector::from_slice(x.as_slice()), g.timestamps())
         .unwrap();
     let predictions: Vec<_> = (0..g.len())
-        .map(|i| int.evaluate(&s.states[i], g.row(i).unwrap(), 2.0).unwrap())
+        .map(|i| {
+            int.evaluate(&s.states()[i], g.row(i).unwrap(), 2.0)
+                .unwrap()
+        })
         .collect();
     let dd = DifferentialDopplerData {
         difference_hz: (0..g.len())
             .map(|i| {
-                int.differential(&s.states[i], g.row(i).unwrap(), g.timestamps()[i])
+                int.differential(&s.states()[i], g.row(i).unwrap(), g.timestamps()[i])
                     .unwrap()
                     .difference_hz
             })
             .collect(),
         sigma_antenna2_hz: 0.3,
     };
-    let data = PassiveRfData {
-        geometry: g,
-        interferometer: int,
-        doppler_hz: predictions.iter().map(|p| p.doppler_hz).collect(),
-        phase_rad: Some(predictions.iter().map(|p| p.phase_rad + 0.7).collect()),
-        sigma_doppler_hz: 0.3,
-        sigma_phase_rad: 0.01,
-    };
+    let data = PassiveRfData::new(
+        g,
+        int,
+        predictions.iter().map(|p| p.doppler_hz).collect(),
+        Some(predictions.iter().map(|p| p.phase_rad + 0.7).collect()),
+        0.3,
+        0.01,
+    )
+    .unwrap();
     let problem = PassiveRfProblem::new_extended(
         cfg,
         data,
@@ -383,7 +403,7 @@ fn augmented_baseline_filter_matches_same_epoch_batch_covariance() {
     let (problem, x) = problem(true);
     let fit = fit_passive_rf(&problem, &x, &LmSettings::default()).unwrap();
     let mut filter = PassiveRfEkf::<12>::new_extended(
-        problem.config().clone(),
+        copy_config(problem.config()),
         OuPhaseNoise::new(21600.0, 0.087).unwrap(),
         problem.prior(),
         Some(v3(0.005, 0.005, 0.005)),
@@ -411,7 +431,7 @@ fn augmented_baseline_filter_matches_same_epoch_batch_covariance() {
     let t = epoch() + Duration::from_seconds(10.0);
     filter.predict_to(t, None).unwrap();
     for k in 9..12 {
-        assert_eq!(filter.steps()[1].f_jacobian[(k, k)], 1.0);
+        assert_eq!(filter.steps().get(1).unwrap().f_jacobian[(k, k)], 1.0);
     }
     assert!(filter.smooth().is_ok());
 }
@@ -502,18 +522,19 @@ fn continental_chord_matches_independent_station_geometry_and_exact_range_rates(
     );
 }
 
-fn separate_problem(same_epoch: bool, local_calibration: bool) -> PassiveRfProblem {
+fn separate_problem(same_epoch: bool, local_calibration: bool) -> PassiveRfProblem<'static> {
     let (original, _) = problem(same_epoch);
     let (first, second) = polar_sites();
     let int = Interferometer::new(first.baseline_enu_to(&second).unwrap(), 2.23e9).unwrap();
     let states = original
         .config()
         .sample(
-            &DynVector::from_slice(&original.prior().mean.as_slice()[..6]),
-            original.data().geometry.timestamps(),
+            &DynVector::from_slice(&original.prior().mean().as_slice()[..6]),
+            original.data().geometry().timestamps(),
         )
         .unwrap()
-        .states;
+        .states()
+        .to_vec();
     let dd = DifferentialDopplerData {
         difference_hz: states
             .iter()
@@ -521,8 +542,8 @@ fn separate_problem(same_epoch: bool, local_calibration: bool) -> PassiveRfProbl
             .map(|(i, x)| {
                 int.differential(
                     x,
-                    original.data().geometry.row(i).unwrap(),
-                    original.data().geometry.timestamps()[i],
+                    original.data().geometry().row(i).unwrap(),
+                    original.data().geometry().timestamps()[i],
                 )
                 .unwrap()
                 .difference_hz
@@ -533,9 +554,9 @@ fn separate_problem(same_epoch: bool, local_calibration: bool) -> PassiveRfProbl
     // The chord is expressed in antenna-1 ENU; using it at the test station
     // still defines a separate Earth-fixed receiver and exercises the layouts.
     PassiveRfProblem::new_extended(
-        original.config().clone(),
-        original.data().clone(),
-        original.prior().clone(),
+        copy_config(original.config()),
+        copy_data_owned(original.data()),
+        copy_prior(original.prior()),
         OuPhaseNoise::new(21600.0, 0.087).unwrap(),
         RfExtensions {
             baseline_sigma_m: local_calibration.then_some(v3(0.005, 0.005, 0.005)),
@@ -579,7 +600,7 @@ fn separate_phase_and_doppler_baseline_columns_match_finite_differences() {
                 );
             }
         }
-        let n = problem.data().geometry.len();
+        let n = problem.data().geometry().len();
         let remote = problem.columns() - 3;
         for i in 0..n {
             for k in remote..remote + 3 {
@@ -604,7 +625,7 @@ fn compare_separate_covariance<const N: usize>(local: bool) {
     .unwrap();
     let ext = problem.extensions();
     let mut f = PassiveRfEkf::<N>::new_with_calibration(
-        problem.config().clone(),
+        copy_config(problem.config()),
         OuPhaseNoise::new(21600.0, 0.087).unwrap(),
         problem.prior(),
         ext.baseline_sigma_m,
@@ -626,13 +647,13 @@ fn compare_separate_covariance<const N: usize>(local: bool) {
         }
     }
     assert!(f.smooth().is_ok());
-    let mut bad = ext.clone();
+    let mut bad = copy_extensions(ext);
     bad.differential_interferometer = None;
     assert!(
         PassiveRfProblem::new_extended(
-            problem.config().clone(),
-            problem.data().clone(),
-            problem.prior().clone(),
+            copy_config(problem.config()),
+            problem.data(),
+            problem.prior(),
             OuPhaseNoise::new(21600.0, 0.087).unwrap(),
             bad
         )

@@ -1,6 +1,11 @@
+#![allow(clippy::disallowed_methods)]
+#[path = "support/mod.rs"]
+mod copies;
+use copies::*;
+
 use numeris::{DynVector, Matrix, Vector, estimate::rts_smooth, optim::LmSettings};
 use satkit::{Duration, Instant, orbitprop::SatPropertiesSimple};
-use std::{f64::consts::PI, sync::Arc};
+use std::f64::consts::PI;
 use tychonic::{
     estimate::*,
     kernels::*,
@@ -98,8 +103,8 @@ fn heterogeneous_correlated_linear_sensors_match_information_solution() {
     assert_close(filter.state(), &expected_x, 1e-9, 1e-13);
     assert_close(filter.covariance(), &expected_p, 1e-9, 1e-12);
     assert_eq!(filter.steps().len(), 1);
-    assert_eq!(filter.steps()[0].x_predicted, initial);
-    assert_eq!(filter.steps()[0].x_updated, *filter.state());
+    assert_eq!(filter.steps().get(0).unwrap().x_predicted, initial);
+    assert_eq!(filter.steps().get(0).unwrap().x_updated, *filter.state());
 }
 
 #[test]
@@ -125,7 +130,7 @@ fn prediction_uses_local_stm_and_augmented_drag_transition() {
         1e-9,
         1e-13,
     );
-    assert_eq!(filter.steps()[1].f_jacobian, phi);
+    assert_eq!(filter.steps().get(1).unwrap().f_jacobian, phi);
 
     // The next prediction must start from the updated orbit, not the original
     // batch reference state, and its history must retain that local Jacobian.
@@ -143,7 +148,7 @@ fn prediction_uses_local_stm_and_augmented_drag_transition() {
         propagate_with_stm(filter.state(), &end, &next, &od_prop_settings(), 0.02).unwrap();
     filter.predict_to(next, None).unwrap();
     assert_eq!(filter.state(), &next_x);
-    assert_eq!(filter.steps()[2].f_jacobian, next_phi);
+    assert_eq!(filter.steps().get(2).unwrap().f_jacobian, next_phi);
 
     let mut x7 = V7::zeros();
     x7.set_block(0, 0, &initial);
@@ -160,7 +165,7 @@ fn prediction_uses_local_stm_and_augmented_drag_transition() {
     let f7 = sens.augmented_transition(0).unwrap();
     augmented.predict_to(end, None).unwrap();
     assert_eq!(augmented.state()[6], 0.02);
-    assert_eq!(augmented.steps()[1].f_jacobian, f7);
+    assert_eq!(augmented.steps().get(1).unwrap().f_jacobian, f7);
     assert_close(
         augmented.covariance(),
         &(f7 * p7 * f7.transpose()),
@@ -171,7 +176,7 @@ fn prediction_uses_local_stm_and_augmented_drag_transition() {
     let before_drag = augmented.state()[6];
     augmented
         .update(
-            &Vector::from_array([sens.states[0][0] + 0.1]),
+            &Vector::from_array([sens.states()[0][0] + 0.1]),
             &|x: &V6| Ok((h * x, h)),
             &Matrix::new([[1.0]]),
             UpdateOptions::default(),
@@ -206,10 +211,10 @@ fn ground_sensors_reuse_partials_and_wrap_azimuth_across_branch_cut() {
         },
     )
     .unwrap();
-    let g = prepared.row(0).unwrap().clone();
+    let g = prepared.row(0).unwrap();
     let initial = v6_from(&v3(1e-3, -6678e3, 200e3), &v3(0.0, 7100.0, 3000.0));
-    let rr_model = GroundSensor::<1>::new(g.clone()).unwrap();
-    let az_model = GroundSensor::<2>::new(g.clone()).unwrap();
+    let rr_model = GroundSensor::<1>::new(g).unwrap();
+    let az_model = GroundSensor::<2>::new(g).unwrap();
     let combined = GroundSensor::<3>::new(g).unwrap();
     let (rr, hr) = rr_model.evaluate(&initial).unwrap();
     let (angles, ha) = az_model.evaluate(&initial).unwrap();
@@ -264,7 +269,7 @@ fn gating_and_errors_preserve_filter_and_history() {
     assert!(!outlier.accepted && outlier.nis > 6.63);
     assert_eq!(*filter.state(), x);
     assert_eq!(*filter.covariance(), p);
-    assert_eq!(filter.steps()[0].x_updated, x);
+    assert_eq!(filter.steps().get(0).unwrap().x_updated, x);
 
     let bad = Observation {
         time: epoch() + Duration::from_seconds(10.0),
@@ -302,19 +307,22 @@ fn gating_and_errors_preserve_filter_and_history() {
         .unwrap();
     assert!(!rejected.accepted);
     assert_eq!(filter.steps().len(), 2);
-    assert_eq!(filter.steps()[1].x_predicted, filter.steps()[1].x_updated);
+    assert_eq!(
+        filter.steps().get(1).unwrap().x_predicted,
+        filter.steps().get(1).unwrap().x_updated
+    );
 }
 
 #[test]
 fn invalid_covariances_models_and_process_noise_return_errors() {
     let c = config(ParameterMode::StateOnly { fixed_drag: 0.0 });
-    assert!(OrbitEkf::new(c.clone(), V7::zeros(), covariance::<7>()).is_err());
-    assert!(OrbitEkf::new(c.clone(), leo(), M6::zeros()).is_err());
+    assert!(OrbitEkf::new(copy_config(&c), V7::zeros(), covariance::<7>()).is_err());
+    assert!(OrbitEkf::new(copy_config(&c), leo(), M6::zeros()).is_err());
     let mut bad = M6::eye();
     bad[(0, 1)] = 2.0;
-    assert!(OrbitEkf::new(c.clone(), leo(), bad).is_err());
+    assert!(OrbitEkf::new(copy_config(&c), leo(), bad).is_err());
     bad[(1, 0)] = 2.0;
-    assert!(OrbitEkf::new(c.clone(), leo(), bad).is_err());
+    assert!(OrbitEkf::new(copy_config(&c), leo(), bad).is_err());
     let mut filter = OrbitEkf::new(c, leo(), covariance::<6>()).unwrap();
     let end = epoch() + Duration::from_seconds(1.0);
     assert!(filter.predict_to(end, Some(&bad)).is_err());
@@ -396,7 +404,7 @@ fn mixed_station_batches_sort_exact_epochs_and_rts_agrees_with_batch_orbit_fit()
             }
         })
         .collect();
-    let geometry = Arc::new(PreparedGeometry::new(&times, &sites).unwrap());
+    let geometry = PreparedGeometry::new(&times, &sites).unwrap();
     let mut rr = Vec::new();
     let mut az = Vec::new();
     let mut el = Vec::new();
@@ -410,7 +418,7 @@ fn mixed_station_batches_sort_exact_epochs_and_rts_agrees_with_batch_orbit_fit()
             &SatPropertiesSimple::new(0.0, 0.0),
         )
         .unwrap();
-        let (z, _) = GroundSensor::<3>::new(geometry.row(i).unwrap().clone())
+        let (z, _) = GroundSensor::<3>::new(geometry.row(i).unwrap())
             .unwrap()
             .evaluate(&state)
             .unwrap();
@@ -419,14 +427,14 @@ fn mixed_station_batches_sort_exact_epochs_and_rts_agrees_with_batch_orbit_fit()
         el.push(z[2]);
     }
     let batches = vec![
-        PreparedBatch::range_rate(geometry.clone(), rr, 0.01).unwrap(),
-        PreparedBatch::azimuth_elevation(geometry, az, el, 1e-6, 1e-6).unwrap(),
+        PreparedBatch::range_rate(&geometry, rr, 0.01).unwrap(),
+        PreparedBatch::azimuth_elevation(&geometry, az, el, 1e-6, 1e-6).unwrap(),
     ];
     let cfg = config(ParameterMode::StateOnly { fixed_drag: 0.0 });
-    let problem = ODProblem::new(cfg.clone(), batches.clone()).unwrap();
+    let problem = ODProblem::new(copy_config(&cfg), &batches).unwrap();
     let initial = truth + numeris::vector![10.0, -8.0, 6.0, 0.01, -0.01, 0.005];
     let batch_fit = fit_lm(
-        problem,
+        &problem,
         &DynVector::from_slice(initial.as_slice()),
         None,
         &LmSettings {
@@ -460,7 +468,7 @@ fn mixed_station_batches_sort_exact_epochs_and_rts_agrees_with_batch_orbit_fit()
         assert!((pair[0].batch, pair[0].row) < (pair[1].batch, pair[1].row));
     }
     let smoothed = filter.smooth().unwrap();
-    let direct = rts_smooth(filter.steps()).unwrap();
+    let direct = rts_smooth(&filter.steps().to_records()).unwrap();
     assert_eq!(smoothed, direct);
     assert_eq!(smoothed.last().unwrap().0, *filter.state());
     assert_eq!(smoothed.last().unwrap().1, *filter.covariance());
@@ -468,7 +476,7 @@ fn mixed_station_batches_sort_exact_epochs_and_rts_agrees_with_batch_orbit_fit()
         assert!(p.as_slice().iter().all(|v| v.is_finite()));
         assert!(p.cholesky().is_ok());
         for j in 0..6 {
-            assert!(p[(j, j)] <= filter.steps()[i].p_updated[(j, j)] + 1e-8);
+            assert!(p[(j, j)] <= filter.steps().get(i).unwrap().p_updated[(j, j)] + 1e-8);
         }
     }
     let initial_smoothed = smoothed[0].0;
@@ -515,7 +523,7 @@ fn combined_measurement_records_fuse_noisy_orbit_with_estimated_drag() {
                 &SatPropertiesSimple::new(0.02, 0.0),
             )
             .unwrap();
-            let (predicted, _) = GroundSensor::<3>::new(geometry.row(i).unwrap().clone())
+            let (predicted, _) = GroundSensor::<3>::new(geometry.row(i).unwrap())
                 .unwrap()
                 .evaluate(&state)
                 .unwrap();
@@ -560,7 +568,7 @@ fn combined_measurement_records_fuse_noisy_orbit_with_estimated_drag() {
         assert!(x.as_slice().iter().all(|v| v.is_finite()));
         assert!(p.cholesky().is_ok());
         for j in 0..7 {
-            assert!(p[(j, j)] <= filter.steps()[i].p_updated[(j, j)] + 1e-8);
+            assert!(p[(j, j)] <= filter.steps().get(i).unwrap().p_updated[(j, j)] + 1e-8);
         }
     }
 }

@@ -48,7 +48,8 @@ pub fn generate(path: &Path, trials: usize) -> AnyResult<()> {
         .collect();
     let states = cfg
         .sample(&DynVector::from_slice(x.as_slice()), &all_times)?
-        .states;
+        .states()
+        .to_vec();
     let first = PreparedGeometry::new(&all_times, &vec![TROMSO; all_times.len()])?;
     let second = PreparedGeometry::new(&all_times, &vec![SVALBARD; all_times.len()])?;
     let selected: Vec<_> = (0..all_times.len())

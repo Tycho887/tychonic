@@ -9,29 +9,64 @@ use crate::kernels::{
     PropagationConfig, Result,
 };
 use numeris::{
-    DynMatrix, DynVector,
-    optim::{LmSettings, least_squares_lm_dyn},
+    DynVector,
+    optim::{LmSettings, OptimError},
 };
+mod input;
+pub use input::InputSource;
+mod lm;
+use lm::{run_lm, run_lm_with_drag};
 use satkit::{Instant, orbitprop::PropSettings};
-use std::{cell::RefCell, collections::BTreeMap, fmt, rc::Rc};
+use std::{collections::BTreeMap, fmt};
 
 /// Immutable collection of batches with a prepared union of exact epochs.
-#[derive(Clone, Debug)]
-pub struct ODProblem {
+#[derive(Debug)]
+pub enum BatchSource<'g> {
+    Owned(Vec<PreparedBatch<'g>>),
+    Borrowed(&'g [PreparedBatch<'g>]),
+}
+impl<'g> From<Vec<PreparedBatch<'g>>> for BatchSource<'g> {
+    fn from(value: Vec<PreparedBatch<'g>>) -> Self {
+        Self::Owned(value)
+    }
+}
+impl<'g> From<&'g [PreparedBatch<'g>]> for BatchSource<'g> {
+    fn from(value: &'g [PreparedBatch<'g>]) -> Self {
+        Self::Borrowed(value)
+    }
+}
+impl<'g> From<&'g Vec<PreparedBatch<'g>>> for BatchSource<'g> {
+    fn from(value: &'g Vec<PreparedBatch<'g>>) -> Self {
+        Self::Borrowed(value)
+    }
+}
+impl<'g> std::ops::Deref for BatchSource<'g> {
+    type Target = [PreparedBatch<'g>];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(value) => value,
+            Self::Borrowed(value) => value,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ODProblem<'g> {
     config: PropagationConfig,
-    batches: Vec<PreparedBatch>,
+    batches: BatchSource<'g>,
     timestamps: Vec<Instant>,
     mappings: Vec<Vec<usize>>,
     rows: usize,
 }
 
-impl ODProblem {
-    pub fn new(config: PropagationConfig, batches: Vec<PreparedBatch>) -> Result<Self> {
+impl<'g> ODProblem<'g> {
+    pub fn new(config: PropagationConfig, batches: impl Into<BatchSource<'g>>) -> Result<Self> {
+        let batches = batches.into();
         if batches.is_empty() {
             return Err(KernelError::InvalidInput("empty observation problem"));
         }
         let mut epochs = BTreeMap::new();
-        for batch in &batches {
+        for batch in batches.iter() {
             for &time in batch.timestamps() {
                 epochs.insert(time, 0);
             }
@@ -79,7 +114,7 @@ impl ODProblem {
     pub fn config(&self) -> &PropagationConfig {
         &self.config
     }
-    pub fn batches(&self) -> &[PreparedBatch] {
+    pub fn batches(&self) -> &[PreparedBatch<'g>] {
         &self.batches
     }
     pub fn timestamps(&self) -> &[Instant] {
@@ -110,41 +145,52 @@ impl ODProblem {
     }
 }
 
-type CacheEntry = (Vec<f64>, Rc<Evaluation>);
-
-/// Last-parameter cache; shared results avoid cloning the entire evaluation.
-pub struct CachedProblem {
-    inner: ODProblem,
-    cache: RefCell<Option<CacheEntry>>,
+/// Last-parameter cache with exclusive access and reusable owned output.
+///
+/// A returned evaluation keeps the cache immutably borrowed until its last use:
+/// ```compile_fail
+/// use tychonic::{optim::CachedProblem, numeris::DynVector};
+/// fn overlapping_access(cache: &mut CachedProblem<'_>, x: &DynVector<f64>) {
+///     let previous = cache.evaluate(x).unwrap();
+///     cache.evaluate(x).unwrap();
+///     println!("{}", previous.rss());
+/// }
+/// ```
+pub struct CachedProblem<'g> {
+    inner: ODProblem<'g>,
+    key: Vec<f64>,
+    output: Evaluation,
+    valid: bool,
 }
 
-impl CachedProblem {
-    pub fn new(problem: ODProblem) -> Self {
+impl<'g> CachedProblem<'g> {
+    pub fn new(problem: ODProblem<'g>) -> Self {
         Self {
             inner: problem,
-            cache: RefCell::new(None),
+            key: Vec::new(),
+            output: Evaluation::default(),
+            valid: false,
         }
     }
-    pub fn inner(&self) -> &ODProblem {
+    pub fn inner(&self) -> &ODProblem<'g> {
         &self.inner
     }
-
-    pub fn evaluate(&self, parameters: &DynVector<f64>) -> Result<Rc<Evaluation>> {
-        if let Some((key, result)) = self.cache.borrow().as_ref()
-            && key == parameters.as_slice()
-        {
-            return Ok(Rc::clone(result));
+    pub fn evaluate(&mut self, parameters: &DynVector<f64>) -> Result<&Evaluation> {
+        if !self.valid || self.key != parameters.as_slice() {
+            self.valid = false;
+            self.inner.evaluate_into(parameters, &mut self.output)?;
+            self.key.clear();
+            self.key.extend_from_slice(parameters.as_slice());
+            self.valid = true;
         }
-        let result = Rc::new(self.inner.evaluate(parameters)?);
-        *self.cache.borrow_mut() = Some((parameters.as_slice().to_vec(), Rc::clone(&result)));
-        Ok(result)
+        Ok(&self.output)
     }
 }
 
 #[derive(Debug)]
 pub enum FitError {
     Kernel(KernelError),
-    Solver(String),
+    Solver(OptimError),
 }
 impl fmt::Display for FitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -178,110 +224,21 @@ pub struct FitResult {
 struct LmOutcome {
     parameters: DynVector<f64>,
     iterations: usize,
-    evaluation: Rc<Evaluation>,
-}
-
-/// Shared LM driver: validates scales, maps dimensionless corrections to
-/// parameters, rejects negative drag, and caches evaluations between callbacks.
-fn run_lm(
-    columns: usize,
-    guess: &DynVector<f64>,
-    scales: Option<&[f64]>,
-    settings: &LmSettings<f64>,
-    evaluate: impl Fn(&DynVector<f64>) -> Result<Rc<Evaluation>>,
-) -> std::result::Result<LmOutcome, FitError> {
-    run_lm_with_drag(
-        columns,
-        guess,
-        scales,
-        settings,
-        (columns == 7).then_some(6),
-        evaluate,
-    )
-}
-
-fn run_lm_with_drag(
-    columns: usize,
-    guess: &DynVector<f64>,
-    scales: Option<&[f64]>,
-    settings: &LmSettings<f64>,
-    drag_index: Option<usize>,
-    evaluate: impl Fn(&DynVector<f64>) -> Result<Rc<Evaluation>>,
-) -> std::result::Result<LmOutcome, FitError> {
-    let defaults = [100.0, 100.0, 100.0, 0.1, 0.1, 0.1, 0.01];
-    let scales = scales.unwrap_or_else(|| defaults.get(..columns).unwrap_or(&[]));
-    if scales.len() != columns || !scales.iter().all(|s| s.is_finite() && *s > 0.0) {
-        return Err(KernelError::InvalidInput(
-            "parameter scales must be finite, positive and dimensionally correct",
-        )
-        .into());
-    }
-    let initial = evaluate(guess)?;
-    let rows = initial.residual.len();
-    let parameters = |z: &DynVector<f64>| {
-        let mut x = guess.clone();
-        for k in 0..columns {
-            x[k] += scales[k] * z[k];
-        }
-        x
-    };
-    let failure = RefCell::new(None);
-    let result = least_squares_lm_dyn(
-        |z| {
-            let x = parameters(z);
-            if drag_index.is_some_and(|index| x[index] < 0.0) {
-                return DynVector::fill(rows, f64::INFINITY);
-            }
-            match evaluate(&x) {
-                Ok(e) => e.residual.clone(),
-                Err(e) => {
-                    *failure.borrow_mut() = Some(e);
-                    DynVector::fill(rows, f64::INFINITY)
-                }
-            }
-        },
-        |z| match evaluate(&parameters(z)) {
-            Ok(e) => {
-                let mut j = e.jacobian.clone();
-                for row in 0..rows {
-                    for k in 0..columns {
-                        j[(row, k)] *= scales[k];
-                    }
-                }
-                j
-            }
-            Err(e) => {
-                *failure.borrow_mut() = Some(e);
-                DynMatrix::zeros(rows, columns)
-            }
-        },
-        &DynVector::zeros(columns),
-        settings,
-    );
-    if let Some(e) = failure.into_inner() {
-        return Err(e.into());
-    }
-    let result = result.map_err(|e| FitError::Solver(format!("{e:?}")))?;
-    let parameters = parameters(&result.x);
-    let evaluation = evaluate(&parameters)?;
-    Ok(LmOutcome {
-        parameters,
-        iterations: result.iterations,
-        evaluation,
-    })
+    evaluation: Evaluation,
 }
 
 /// Solve dimensionless corrections around `guess`. Defaults preserve the demo's
-/// metre, m/s and drag scales. Kernel errors survive numeris's infallible callbacks.
+/// metre, m/s and drag scales. Evaluations are fallible and sequential.
 pub fn fit_lm(
-    problem: ODProblem,
+    problem: &ODProblem<'_>,
     guess: &DynVector<f64>,
     scales: Option<&[f64]>,
     settings: &LmSettings<f64>,
 ) -> std::result::Result<FitResult, FitError> {
     let columns = problem.config.mode().columns();
-    let cached = CachedProblem::new(problem);
-    let outcome = run_lm(columns, guess, scales, settings, |x| cached.evaluate(x))?;
+    let outcome = run_lm(columns, guess, scales, settings, |x, output| {
+        problem.evaluate_into(x, output)
+    })?;
     Ok(FitResult {
         parameters: outcome.parameters,
         iterations: outcome.iterations,

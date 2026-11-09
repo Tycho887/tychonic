@@ -1,0 +1,12 @@
+disallowed-types = [
+    "std::sync::Arc",
+    "std::rc::Rc",
+    "std::cell::RefCell",
+    "std::sync::Mutex",
+    "std::sync::RwLock",
+]
+disallowed-methods = [
+    { path = "std::clone::Clone::clone", reason = "Use borrowing or explicit owned buffers; documented dependency copies are scoped exceptions." },
+    { path = "std::thread::spawn", reason = "Kernels and estimators execute on the caller's thread." },
+    { path = "std::thread::Builder::spawn", reason = "Kernels and estimators execute on the caller's thread." },
+]

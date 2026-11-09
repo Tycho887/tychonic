@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 #[path = "../benches/support/mod.rs"]
 #[allow(dead_code)]
 mod support;
@@ -19,7 +20,7 @@ fn seeded_measurement_and_chained_jacobians_match_central_differences() {
     let f = Fixture::new(512).unwrap();
     let chained = compute_full_jacobian(&f.sensitivities, &f.station, &f.enu).unwrap();
     for i in 0..512 {
-        let state = f.sensitivities.states[i];
+        let state = f.sensitivities.states()[i];
         let range = (r_of(&state) - f.station.position[i]).norm();
         let predict = |x: &V6| {
             let (rr, _) = range_rate_partial(
@@ -73,9 +74,9 @@ fn seeded_measurement_and_chained_jacobians_match_central_differences() {
         }
         for k in 0..7 {
             let column = if k < 6 {
-                f.sensitivities.stm[i].block::<6, 1>(0, k)
+                f.sensitivities.stm()[i].block::<6, 1>(0, k)
             } else {
-                f.sensitivities.state_dcd[i]
+                f.sensitivities.state_dcd()[i]
             };
             let step = if k < 3 { 0.1 } else { 0.001 };
             let p = predict(&(state + column * step));
@@ -197,7 +198,7 @@ fn large_chained_batches_have_finite_outputs_and_preserve_selected_rows() {
         assert!(matrix.as_slice().iter().all(|v| v.is_finite()));
     }
     for i in [0, 15, 255, 1023, 16383, 65535] {
-        let x = &f.sensitivities.states[i];
+        let x = &f.sensitivities.states()[i];
         let (_, h) = range_rate_partial(
             &r_of(x),
             &v_of(x),
@@ -205,7 +206,7 @@ fn large_chained_batches_have_finite_outputs_and_preserve_selected_rows() {
             &f.station.velocity[i],
         )
         .unwrap();
-        let expected = h * f.sensitivities.stm[i];
+        let expected = h * f.sensitivities.stm()[i];
         for k in 0..6 {
             assert_eq!(jac.range_rate[(i, k)], expected[(0, k)]);
         }

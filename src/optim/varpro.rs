@@ -6,7 +6,7 @@ use crate::kernels::{
 };
 use numeris::{DynMatrix, DynVector, optim::LmSettings};
 use satkit::Instant;
-use std::{cell::RefCell, collections::BTreeMap, fmt, rc::Rc, sync::Arc};
+use std::{collections::BTreeMap, fmt};
 
 /// A contact identifier stored as a 128-bit UUID value.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -22,41 +22,49 @@ impl ContactId {
     /// Accept 32 bare hex digits or the hyphenated 8-4-4-4-12 form.
     pub fn parse(text: &str) -> Result<Self> {
         let bytes = text.as_bytes();
-        let hyphenated = match bytes.len() {
-            32 => false,
-            36 => {
-                if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
-                    return Err(KernelError::InvalidInput(
-                        "contact identifier is not a UUID",
-                    ));
-                }
-                true
-            }
-            _ => {
-                return Err(KernelError::InvalidInput(
-                    "contact identifier must have 32 hex digits",
-                ));
-            }
-        };
+        let hyphenated = uuid_has_hyphens(bytes)?;
         let mut value = 0u128;
         for (index, byte) in bytes.iter().enumerate() {
             if hyphenated && matches!(index, 8 | 13 | 18 | 23) {
                 continue;
             }
-            let digit = match byte {
-                b'0'..=b'9' => byte - b'0',
-                b'a'..=b'f' => byte - b'a' + 10,
-                b'A'..=b'F' => byte - b'A' + 10,
-                _ => {
-                    return Err(KernelError::InvalidInput(
-                        "contact identifier contains a non-hex digit",
-                    ));
-                }
-            };
+            let digit = hex_digit(*byte)?;
             value = (value << 4) | u128::from(digit);
         }
         Ok(Self(value))
     }
+}
+
+fn uuid_has_hyphens(bytes: &[u8]) -> Result<bool> {
+    Ok(match bytes.len() {
+        32 => false,
+        36 => {
+            if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
+                return Err(KernelError::InvalidInput(
+                    "contact identifier is not a UUID",
+                ));
+            }
+            true
+        }
+        _ => {
+            return Err(KernelError::InvalidInput(
+                "contact identifier must have 32 hex digits",
+            ));
+        }
+    })
+}
+
+fn hex_digit(byte: u8) -> Result<u8> {
+    Ok(match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => {
+            return Err(KernelError::InvalidInput(
+                "contact identifier contains a non-hex digit",
+            ));
+        }
+    })
 }
 
 impl From<u128> for ContactId {
@@ -96,7 +104,7 @@ pub struct PointingConstraint {
 }
 
 /// Diagonal whitening structure of the contact bias columns.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ContactBiasMap {
     row_contact: Vec<Option<usize>>,
     row_weight: Vec<f64>,
@@ -184,17 +192,13 @@ impl ContactBiasMap {
             let scale = self.row_weight[row] / self.norm[contact];
             let residual = evaluation.residual[row] - scale * sum[contact];
             if !residual.is_finite() {
-                return Err(KernelError::InvalidInput(
-                    "projected residual is not finite",
-                ));
+                return Err(KernelError::Numerical("projected residual is not finite"));
             }
             evaluation.residual[row] = residual;
             for k in 0..columns {
                 let value = evaluation.jacobian[(row, k)] - scale * gram[contact * columns + k];
                 if !value.is_finite() {
-                    return Err(KernelError::InvalidInput(
-                        "projected Jacobian is not finite",
-                    ));
+                    return Err(KernelError::Numerical("projected Jacobian is not finite"));
                 }
                 evaluation.jacobian[(row, k)] = value;
             }
@@ -222,9 +226,9 @@ impl ContactBiasMap {
 }
 
 /// Range-rate contacts with eliminated biases plus optional pointing constraints.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ContactBiasProblem {
-    inner: ODProblem,
+    inner: ODProblem<'static>,
     contacts: Vec<ContactId>,
     map: ContactBiasMap,
 }
@@ -255,14 +259,14 @@ impl ContactBiasProblem {
         let times: Vec<_> = range_rates.iter().map(|rr| rr.time).collect();
         let stations: Vec<_> = range_rates.iter().map(|rr| rr.station).collect();
         let values: Vec<_> = range_rates.iter().map(|rr| rr.range_rate).collect();
-        let geometry = Arc::new(PreparedGeometry::new(&times, &stations)?);
+        let geometry = PreparedGeometry::new(&times, &stations)?;
         let mut batches = vec![PreparedBatch::range_rate(geometry, values, noise.sigma_rr)?];
         if !pointing.is_empty() {
             let times: Vec<_> = pointing.iter().map(|p| p.time).collect();
             let stations: Vec<_> = pointing.iter().map(|p| p.station).collect();
             let azimuth: Vec<_> = pointing.iter().map(|p| p.azimuth).collect();
             let elevation: Vec<_> = pointing.iter().map(|p| p.elevation).collect();
-            let geometry = Arc::new(PreparedGeometry::new(&times, &stations)?);
+            let geometry = PreparedGeometry::new(&times, &stations)?;
             batches.push(PreparedBatch::azimuth_elevation(
                 geometry,
                 azimuth,
@@ -313,7 +317,7 @@ impl ContactBiasProblem {
         &self.contacts
     }
 
-    pub fn inner(&self) -> &ODProblem {
+    pub fn inner(&self) -> &ODProblem<'static> {
         &self.inner
     }
 
@@ -359,18 +363,18 @@ impl ContactBiasProblem {
         let inverse = information.inverse().map_err(|_| KernelError::Singular)?;
         let scale = evaluation.rss() / dof as f64;
         if !scale.is_finite() {
-            return Err(KernelError::InvalidInput("residual scale is not finite"));
+            return Err(KernelError::Numerical("residual scale is not finite"));
         }
         let covariance = inverse * scale;
         if (0..columns).any(|i| (0..columns).any(|j| !covariance[(i, j)].is_finite())) {
-            return Err(KernelError::InvalidInput("covariance is not finite"));
+            return Err(KernelError::Numerical("covariance is not finite"));
         }
         Ok(covariance)
     }
 }
 
 /// Fit result including eliminated biases and the state covariance.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct VarproFit {
     pub parameters: DynVector<f64>,
     pub biases: Vec<f64>,
@@ -379,58 +383,18 @@ pub struct VarproFit {
     pub rss: f64,
 }
 
-type CachedReduction = (Vec<f64>, Rc<Evaluation>, Rc<Evaluation>);
-
-struct ReducedProblem<'a> {
-    problem: &'a ContactBiasProblem,
-    cache: RefCell<Option<CachedReduction>>,
-}
-
-impl<'a> ReducedProblem<'a> {
-    fn new(problem: &'a ContactBiasProblem) -> Self {
-        Self {
-            problem,
-            cache: RefCell::new(None),
-        }
-    }
-
-    fn cached(&self, parameters: &DynVector<f64>) -> Result<(Rc<Evaluation>, Rc<Evaluation>)> {
-        if let Some((key, raw, reduced)) = self.cache.borrow().as_ref()
-            && key == parameters.as_slice()
-        {
-            return Ok((Rc::clone(raw), Rc::clone(reduced)));
-        }
-        let raw = Rc::new(self.problem.evaluate(parameters)?);
-        let mut reduced = (*raw).clone();
-        self.problem.map.project(&mut reduced)?;
-        let reduced = Rc::new(reduced);
-        *self.cache.borrow_mut() = Some((
-            parameters.as_slice().to_vec(),
-            Rc::clone(&raw),
-            Rc::clone(&reduced),
-        ));
-        Ok((raw, reduced))
-    }
-
-    fn evaluate(&self, parameters: &DynVector<f64>) -> Result<Rc<Evaluation>> {
-        Ok(self.cached(parameters)?.1)
-    }
-
-    fn raw(&self, parameters: &DynVector<f64>) -> Result<Rc<Evaluation>> {
-        Ok(self.cached(parameters)?.0)
-    }
-}
-
 pub fn fit_varpro(
-    problem: ContactBiasProblem,
+    problem: &ContactBiasProblem,
     guess: &DynVector<f64>,
     scales: Option<&[f64]>,
     settings: &LmSettings<f64>,
 ) -> std::result::Result<VarproFit, FitError> {
     let columns = problem.inner.config().mode().columns();
-    let reduced = ReducedProblem::new(&problem);
-    let outcome = run_lm(columns, guess, scales, settings, |x| reduced.evaluate(x))?;
-    let raw = reduced.raw(&outcome.parameters)?;
+    let outcome = run_lm(columns, guess, scales, settings, |x, output| {
+        problem.inner.evaluate_into(x, output)?;
+        problem.map.project(output)
+    })?;
+    let raw = problem.evaluate(&outcome.parameters)?;
     let biases = problem.bias_map().solve(&raw.residual)?;
     let covariance = problem.covariance_from(&outcome.evaluation)?;
     Ok(VarproFit {
@@ -453,7 +417,7 @@ pub fn fit_bootstrap(
     settings: &LmSettings<f64>,
 ) -> std::result::Result<VarproFit, FitError> {
     fit_varpro(
-        ContactBiasProblem::new(config, range_rates, pointing, noise)?,
+        &ContactBiasProblem::new(config, range_rates, pointing, noise)?,
         guess,
         scales,
         settings,

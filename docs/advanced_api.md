@@ -1,6 +1,7 @@
 # Advanced numerical API
 
-The original low-level APIs remain available alongside the v0.9.0 measurement facade.
+The low-level kernels complement the measurement facade. Version 0.9.2 changes
+ownership and validated-input APIs; see the [migration guide](migration_0_9_2.md).
 
 ## Conventions and API
 
@@ -122,13 +123,12 @@ described below apply to this estimator as well.
 Prepare geometry and observations once, then evaluate changing reference states:
 
 ```rust
-use std::sync::Arc;
 use tychonic::kernels::*;
 
-let geometry = Arc::new(PreparedGeometry::new(&times, &stations)?);
-let range_rates = PreparedBatch::range_rate(geometry.clone(), observed_rr, 0.05)?;
+let geometry = PreparedGeometry::new(&times, &stations)?;
+let range_rates = PreparedBatch::range_rate(&geometry, observed_rr, 0.05)?;
 let angles = PreparedBatch::azimuth_elevation(
-    geometry, observed_az, observed_el, 1e-4, 2e-4,
+    &geometry, observed_az, observed_el, 1e-4, 2e-4,
 )?;
 let config = PropagationConfig::new(
     reference_epoch, od_prop_settings(),
@@ -162,7 +162,7 @@ ITRF geometry once per station, and station states/ENU matrices once per distinc
 station–epoch pair. Duplicate rows reference the same immutable entry.
 `geometry.row(i)` exposes read-only position, velocity and `ValidatedRotation`;
 `geometry.stations()` retains input station coordinates. Caches live with the
-prepared geometry and can be shared through `Arc`. Rebuild geometry when station
+prepared geometry and can be shared through immutable borrows. Rebuild geometry when station
 coordinates or external frame data change.
 
 `ValidatedRotation::new(matrix)` checks a finite, orthonormal, right-handed
@@ -183,7 +183,7 @@ use tychonic::optim::{ODProblem, fit_lm};
 
 let problem = ODProblem::new(config, vec![range_rates, angles])?;
 let evaluation = problem.evaluate(&initial_state_parameters)?;
-let fit = fit_lm(problem, &initial_state_parameters, None, &lm_settings)?;
+let fit = fit_lm(&problem, &initial_state_parameters, None, &lm_settings)?;
 ```
 
 `ODProblem` prepares a union of exact epochs, samples sensitivities once per
@@ -193,11 +193,13 @@ order, including duplicate and unsorted epochs. Its `evaluate_into` variant
 reuses output storage. Geometry, batches and propagation configuration are
 immutable and accessible through getters.
 
-`CachedProblem::evaluate` returns `Rc<Evaluation>` and shares the latest result
-between residual and Jacobian callbacks. A changed parameter vector refreshes
-the cache; a failed evaluation leaves the last successful entry intact.
-`fit_lm` clones only the output required by each numeris callback, solves scaled
-corrections, rejects negative-drag trials, and preserves kernel errors.
+`CachedProblem::evaluate(&mut self, parameters)` returns `&Evaluation` from
+reusable owned buffers. A changed parameter vector refreshes the cache; errors
+invalidate the cache until another evaluation succeeds. Rust prevents another
+mutable cache access while a returned evaluation remains in use.
+`fit_lm(&problem, ...)` uses a sequential, fallible Tychonic LM driver. It evaluates
+residuals and Jacobians together, solves scaled corrections, rejects negative-drag
+trials, and propagates kernel errors directly.
 Default scales are `[100, 100, 100, 0.1, 0.1, 0.1, 0.01]`, truncated for
 state-only fits; callers may supply positive scales explicitly. Choose stopping
 tolerances consistent with propagation accuracy. The noisy regression uses
@@ -243,7 +245,7 @@ let config = PropagationConfig::new(
     ParameterMode::StateAndDrag { delta_cd: 1e-4 },
 )?;
 let problem = ContactBiasProblem::new(config, &contacts, &pointing, noise)?;
-let fit = fit_varpro(problem, &guess, None, &LmSettings::default())?;
+let fit = fit_varpro(&problem, &guess, None, &LmSettings::default())?;
 // fit.parameters: 7 nonlinear parameters
 // fit.biases: one constant m/s offset per contact
 // fit.covariance: state block of the joint covariance

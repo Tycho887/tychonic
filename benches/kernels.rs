@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 #[path = "support/mod.rs"]
 #[allow(dead_code)]
 mod support;
@@ -196,7 +197,10 @@ fn varpro_benchmarks(c: &mut Criterion) {
             row_count,
             |b, _| {
                 b.iter_batched(
-                    || fixture.evaluation.clone(),
+                    || Evaluation {
+                        residual: fixture.evaluation.residual.clone(),
+                        jacobian: fixture.evaluation.jacobian.clone(),
+                    },
                     |mut evaluation| {
                         fixture.map.project(&mut evaluation).unwrap();
                         black_box(evaluation)

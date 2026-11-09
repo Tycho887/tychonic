@@ -1,0 +1,45 @@
+name: Rust contracts
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_checks:
+        description: Run the long regression and package verification
+        type: boolean
+        default: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      SATKIT_DATA: ${{ runner.temp }}/satkit-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tools -> target
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.SATKIT_DATA }}
+          key: satkit-data-0.24.1
+      - run: python3 scripts/check_core_policy.py
+      - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path tools/Cargo.toml --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo check --manifest-path tools/Cargo.toml --locked --all-targets --all-features
+      - run: cargo run --locked --manifest-path tools/Cargo.toml --bin provision_data
+      - run: cargo test --locked
+        env:
+          SATKIT_OFFLINE: '1'
+      - run: cargo doc --locked --no-deps --lib
+      - if: ${{ inputs.release_checks }}
+        run: cargo test --locked --release --test bootstrap bootstrap_24_hour_fit_recovers_state_and_drag_from_weak_pointing -- --ignored --exact
+        env:
+          SATKIT_OFFLINE: '1'
+      - if: ${{ inputs.release_checks }}
+        run: cargo package --locked --offline

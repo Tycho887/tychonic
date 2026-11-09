@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use satkit::{Duration, ITRFCoord, Instant, frametransform};
 use tychonic::{kernels::*, optim::ODProblem};
 
@@ -108,6 +109,10 @@ fn malformed_geometry_and_measurement_records_are_rejected() {
         alt_m: 100.0,
     };
     assert!(precompute_station_geometry(&[t], &[]).is_err());
+    assert!(precompute_station_geometry(&[Instant::INVALID], &[site]).is_err());
+    assert!(PreparedGeometry::new(&[Instant::INVALID], &[site]).is_err());
+    let coord = ITRFCoord::from_geodetic_deg(site.lat_deg, site.lon_deg, site.alt_m);
+    assert!(convert_az_el_to_gcrf(0.0, 0.0, &coord, &Instant::INVALID).is_err());
     for invalid in [
         GroundStation {
             lat_deg: 91.0,

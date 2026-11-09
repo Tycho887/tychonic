@@ -1,4 +1,8 @@
-use std::{f64::consts::TAU, sync::Arc};
+#![allow(clippy::disallowed_methods)]
+#[path = "support/mod.rs"]
+mod copies;
+
+use std::f64::consts::TAU;
 use tychonic::{
     OrbitFilter,
     estimate::*,
@@ -24,25 +28,24 @@ fn config(drag: bool) -> PropagationConfig {
     )
     .unwrap()
 }
-fn geometry(seconds: &[f64]) -> Arc<PreparedGeometry> {
+fn geometry(seconds: &[f64]) -> PreparedGeometry {
     let times: Vec<_> = seconds
         .iter()
         .map(|s| epoch() + Duration::from_seconds(*s))
         .collect();
-    Arc::new(
-        PreparedGeometry::new(
-            &times,
-            &vec![
-                GroundStation {
-                    lat_deg: 40.0,
-                    lon_deg: -75.0,
-                    alt_m: 100.0,
-                };
-                times.len()
-            ],
-        )
-        .unwrap(),
+
+    PreparedGeometry::new(
+        &times,
+        &vec![
+            GroundStation {
+                lat_deg: 40.0,
+                lon_deg: -75.0,
+                alt_m: 100.0,
+            };
+            times.len()
+        ],
     )
+    .unwrap()
 }
 fn initial() -> V6 {
     let g = geometry(&[0.0]);
@@ -117,7 +120,7 @@ fn noise(mask: u8) -> DynMatrix<f64> {
         sigmas[i] * sigmas[j] * if i == j { 1.0 } else { 0.15 }
     })
 }
-fn batch(mask: u8, seconds: &[f64], drag: bool) -> (PreparedBatch, DynVector<f64>) {
+fn batch(mask: u8, seconds: &[f64], drag: bool) -> (PreparedBatch<'static>, DynVector<f64>) {
     let g = geometry(seconds);
     let mut x = initial().as_slice().to_vec();
     if drag {
@@ -126,7 +129,14 @@ fn batch(mask: u8, seconds: &[f64], drag: bool) -> (PreparedBatch, DynVector<f64
     let x = DynVector::from_slice(&x);
     let sens = config(drag).sample(&x, g.timestamps()).unwrap();
     let z = (0..g.len())
-        .map(|i| values(mask, &sens.states[i], g.row(i).unwrap(), g.timestamps()[i]))
+        .map(|i| {
+            values(
+                mask,
+                &sens.states()[i],
+                g.row(i).unwrap(),
+                g.timestamps()[i],
+            )
+        })
         .collect();
     let covariances = vec![noise(mask); g.len()];
     // Selection order is deliberately reversed; values retain canonical order.
@@ -228,10 +238,10 @@ fn named_batches_and_sensors_support_independent_observables() {
     let g = geometry(&[0.0]);
     let z = values(15, &initial(), g.row(0).unwrap(), epoch());
     let batches = [
-        doppler(g.clone(), 2.23e9, vec![z[0]], 0.5).unwrap(),
-        phase_difference(g.clone(), interferometer(), vec![z[1]], 0.01).unwrap(),
-        differential_doppler(g.clone(), interferometer(), vec![z[2]], 0.7).unwrap(),
-        azimuth_elevation(g.clone(), vec![z[3]], vec![z[4]], 1e-4, 2e-4).unwrap(),
+        doppler(&g, 2.23e9, vec![z[0]], 0.5).unwrap(),
+        phase_difference(&g, interferometer(), vec![z[1]], 0.01).unwrap(),
+        differential_doppler(&g, interferometer(), vec![z[2]], 0.7).unwrap(),
+        azimuth_elevation(&g, vec![z[3]], vec![z[4]], 1e-4, 2e-4).unwrap(),
     ];
     for b in &batches {
         assert_eq!(
@@ -242,20 +252,20 @@ fn named_batches_and_sensors_support_independent_observables() {
         );
     }
     let sensors = [
-        doppler_sensor(g.row(0).unwrap().clone(), epoch(), 2.23e9).unwrap(),
-        phase_difference_sensor(g.row(0).unwrap().clone(), epoch(), interferometer()).unwrap(),
-        differential_doppler_sensor(g.row(0).unwrap().clone(), epoch(), interferometer()).unwrap(),
+        doppler_sensor(g.row(0).unwrap(), epoch(), 2.23e9).unwrap(),
+        phase_difference_sensor(g.row(0).unwrap(), epoch(), interferometer()).unwrap(),
+        differential_doppler_sensor(g.row(0).unwrap(), epoch(), interferometer()).unwrap(),
     ];
     for (i, s) in sensors.iter().enumerate() {
         close(s.evaluate(&initial()).unwrap().0[0], z[i], 0.0, 0.0);
     }
-    let angles = azimuth_elevation_sensor(g.row(0).unwrap().clone(), epoch())
+    let angles = azimuth_elevation_sensor(g.row(0).unwrap(), epoch())
         .unwrap()
         .evaluate(&initial())
         .unwrap()
         .0;
     assert_eq!(angles.as_slice(), &z[3..]);
-    assert!(PreparedBatch::doppler(g.clone(), 2.23e9, vec![z[0]], 0.5).is_ok());
+    assert!(PreparedBatch::doppler(&g, 2.23e9, vec![z[0]], 0.5).is_ok());
     assert!(PreparedBatch::differential_doppler(g, interferometer(), vec![z[2]], 0.7).is_ok());
 }
 
@@ -358,24 +368,16 @@ fn angular_wrapping_validation_and_offset_calibration() {
     close(o.model.innovation(&o.value, &pred)[3], 0.0, 1e-15, 0.0);
     o.value[1] += TAU;
     close(o.model.innovation(&o.value, &pred)[1], TAU, 5e-14, 0.0);
-    let g = b.geometry().clone();
+    let g = b.geometry();
     let mut z = values(15, &initial(), g.row(0).unwrap(), epoch());
     z[3] += TAU;
-    let wrapped = joint(g.clone(), selection(15), vec![z], vec![noise(15)]).unwrap();
+    let wrapped = joint(g, selection(15), vec![z], vec![noise(15)]).unwrap();
     assert!(wrapped.evaluate(&x, &config(false)).unwrap().rss() < 1e-20);
+    assert!(joint(g, vec![], vec![vec![]], vec![DynMatrix::zeros(0, 0)]).is_err());
+    assert!(joint_sensor::<2>(g.row(0).unwrap(), epoch(), selection(1)).is_err());
     assert!(
         joint(
-            g.clone(),
-            vec![],
-            vec![vec![]],
-            vec![DynMatrix::zeros(0, 0)]
-        )
-        .is_err()
-    );
-    assert!(joint_sensor::<2>(g.row(0).unwrap().clone(), epoch(), selection(1)).is_err());
-    assert!(
-        joint(
-            g.clone(),
+            g,
             vec![selection(1)[0]; 2],
             vec![vec![0.0; 2]],
             vec![noise(5)]
@@ -387,14 +389,14 @@ fn angular_wrapping_validation_and_offset_calibration() {
         DynMatrix::from_fn(1, 1, |_, _| f64::NAN),
         DynMatrix::zeros(2, 2),
     ] {
-        assert!(joint(g.clone(), selection(1), vec![vec![0.0]], vec![r]).is_err());
+        assert!(joint(g, selection(1), vec![vec![0.0]], vec![r]).is_err());
     }
     let mut r = noise(5);
     r[(0, 1)] += 0.1;
-    assert!(joint(g.clone(), selection(5), vec![vec![0.0; 2]], vec![r]).is_err());
-    assert!(doppler(g.clone(), -1.0, vec![0.0], 1.0).is_err());
-    assert!(doppler(g.clone(), 1.0, vec![0.0], 1e-300).is_err());
-    assert!(differential_doppler(g.clone(), interferometer(), vec![], 1.0).is_err());
+    assert!(joint(g, selection(5), vec![vec![0.0; 2]], vec![r]).is_err());
+    assert!(doppler(g, -1.0, vec![0.0], 1.0).is_err());
+    assert!(doppler(g, 1.0, vec![0.0], 1e-300).is_err());
+    assert!(differential_doppler(g, interferometer(), vec![], 1.0).is_err());
     assert!(b.joint_observation::<5>(1).is_err());
     let offsets = vec![
         Observable::Doppler {
@@ -407,7 +409,7 @@ fn angular_wrapping_validation_and_offset_calibration() {
             phase_offset_rad: 0.4,
         },
     ];
-    let sensor = joint_sensor::<2>(g.row(0).unwrap().clone(), epoch(), offsets).unwrap();
+    let sensor = joint_sensor::<2>(g.row(0).unwrap(), epoch(), offsets).unwrap();
     let z = sensor.evaluate(&initial()).unwrap().0;
     close(
         z[0],
@@ -442,14 +444,13 @@ fn convenience_fits_and_epoch_union_match_advanced_solver() {
         ..LmSettings::default()
     };
     let advanced = fit_lm(
-        ODProblem::new(config(false), batches.clone()).unwrap(),
+        &ODProblem::new(config(false), &batches).unwrap(),
         &guess,
         None,
         &settings,
     )
     .unwrap();
-    let facade =
-        m::fit_with_options(config(false), batches.clone(), &guess, None, &settings).unwrap();
+    let facade = m::fit_with_options(config(false), &batches, &guess, None, &settings).unwrap();
     assert_eq!(facade.parameters, advanced.parameters);
     assert_eq!(facade.rss, advanced.rss);
     assert!(facade.rss < 1e-8);
@@ -462,31 +463,32 @@ fn named_rf_priors_match_advanced_batch_and_filter_setup() {
     let g = geometry(&[0.0, 20.0]);
     let x = DynVector::from_slice(initial().as_slice());
     let s = config(false).sample(&x, g.timestamps()).unwrap();
-    let data = PassiveRfData {
-        geometry: g.clone(),
-        interferometer: interferometer(),
-        doppler_hz: (0..g.len())
+    let data = PassiveRfData::new(
+        &g,
+        interferometer(),
+        (0..g.len())
             .map(|i| {
                 interferometer()
-                    .evaluate(&s.states[i], g.row(i).unwrap(), 3.0)
+                    .evaluate(&s.states()[i], g.row(i).unwrap(), 3.0)
                     .unwrap()
                     .doppler_hz
             })
             .collect(),
-        phase_rad: Some(
+        Some(
             (0..g.len())
                 .map(|i| {
                     interferometer()
-                        .evaluate(&s.states[i], g.row(i).unwrap(), 3.0)
+                        .evaluate(&s.states()[i], g.row(i).unwrap(), 3.0)
                         .unwrap()
                         .phase_rad
                         + 0.2
                 })
                 .collect(),
         ),
-        sigma_doppler_hz: 0.5,
-        sigma_phase_rad: 0.01,
-    };
+        0.5,
+        0.01,
+    )
+    .unwrap();
     let priors = RfPriors {
         orbit_mean: x.clone(),
         orbit_sigma: DynVector::from_slice(&[100.0, 100.0, 100.0, 0.1, 0.1, 0.1]),
@@ -500,18 +502,19 @@ fn named_rf_priors_match_advanced_batch_and_filter_setup() {
         },
     };
     let drift = OuPhaseNoise::new(21600.0, 0.1).unwrap();
-    let builder = RfBuilder::new(config(false), data.clone(), priors, drift);
+    let builder = RfBuilder::new(config(false), &data, priors, drift);
     let advanced = PassiveRfProblem::new(
         config(false),
-        data,
-        RfPrior {
-            mean: DynVector::from_slice(&[x[0], x[1], x[2], x[3], x[4], x[5], 3.0, 0.2]),
-            sigma: DynVector::from_slice(&[100.0, 100.0, 100.0, 0.1, 0.1, 0.1, 1.0, 0.5]),
-        },
+        &data,
+        RfPrior::new(
+            DynVector::from_slice(&[x[0], x[1], x[2], x[3], x[4], x[5], 3.0, 0.2]),
+            DynVector::from_slice(&[100.0, 100.0, 100.0, 0.1, 0.1, 0.1, 1.0, 0.5]),
+        )
+        .unwrap(),
         drift,
     )
     .unwrap();
-    let facade = builder.clone().build().unwrap();
+    let facade = builder.build().unwrap();
     assert_eq!(
         facade.evaluate(&facade.initial_parameters()).unwrap(),
         advanced.evaluate(&advanced.initial_parameters()).unwrap()
@@ -528,13 +531,12 @@ fn named_rf_priors_match_advanced_batch_and_filter_setup() {
     assert_eq!(filter.state(), expected.state());
     assert_eq!(filter.covariance(), expected.covariance());
     assert!(builder.filter::<10>().is_err());
+    let fit = builder.fit().unwrap();
+    assert!(fit.rss < 1e-15);
     assert!(
         builder
-            .clone()
             .baseline_calibration(v3(0.01, 0.01, 0.01))
             .filter::<12>()
             .is_ok()
     );
-    let fit = builder.fit().unwrap();
-    assert!(fit.rss < 1e-15);
 }

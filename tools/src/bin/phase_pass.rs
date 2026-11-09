@@ -6,7 +6,6 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::Arc,
 };
 use tychonic::{estimate::*, kernels::*, optim::*};
 use tychonic::{numeris, satkit};
@@ -214,7 +213,7 @@ fn main() -> AnyResult<()> {
             let g = all_geometry.row(i).unwrap();
             let local = g
                 .rotation()
-                .to_enu(&(r_of(&all_truth.states[i]) - g.position()));
+                .to_enu(&(r_of(&all_truth.states()[i]) - g.position()));
             local[2].atan2(local[0].hypot(local[1])) >= o.min_elevation_deg.to_radians()
         })
         .collect();
@@ -222,8 +221,8 @@ fn main() -> AnyResult<()> {
         return Err("fewer than eight visible observations".into());
     }
     let times: Vec<_> = selected.iter().map(|&i| all_times[i]).collect();
-    let truth: Vec<_> = selected.iter().map(|&i| all_truth.states[i]).collect();
-    let geometry = Arc::new(PreparedGeometry::new(&times, &vec![station; times.len()])?);
+    let truth: Vec<_> = selected.iter().map(|&i| all_truth.states()[i]).collect();
+    let geometry = PreparedGeometry::new(&times, &vec![station; times.len()])?;
     let epoch = times[0];
     let final_truth = *truth.last().unwrap();
     let n = times.len();
@@ -326,19 +325,17 @@ fn main() -> AnyResult<()> {
         for i in 0..6 {
             mean[i] = truth[0][i] + sigmas[i] * rng.normal();
         }
-        let prior = RfPrior {
-            mean,
-            sigma: sigmas,
-        };
+        let prior = RfPrior::new(mean, sigmas)?;
         for i in 0..8 {
             writeln!(
                 priors,
                 "{trial},{seed},{i},{:.16e},{:.16e}",
-                prior.mean[i], prior.sigma[i]
+                prior.mean()[i],
+                prior.sigma()[i]
             )?;
         }
-        let true_frequency_bias = prior.sigma[6] * rng.normal();
-        let true_phase_mean = prior.sigma[7] * rng.normal();
+        let true_frequency_bias = prior.sigma()[6] * rng.normal();
+        let true_phase_mean = prior.sigma()[7] * rng.normal();
         let mut drift = vec![ou.stationary_sigma_rad() * rng.normal(); n];
         for i in 1..n {
             let (a, q) = ou.transition((times[i] - times[i - 1]).as_seconds())?;
@@ -357,13 +354,13 @@ fn main() -> AnyResult<()> {
             } else {
                 level.to_radians()
             };
-            let data = PassiveRfData {
-                geometry: geometry.clone(),
+            let data = PassiveRfData::new(
+                &geometry,
                 interferometer,
-                doppler_hz: (0..n)
+                (0..n)
                     .map(|i| predictions[i].doppler_hz + sigma_f * zf[i])
                     .collect(),
-                phase_rad: (level > 0.0).then(|| {
+                (level > 0.0).then(|| {
                     (0..n)
                         .map(|i| {
                             predictions[i].phase_rad
@@ -373,16 +370,16 @@ fn main() -> AnyResult<()> {
                         })
                         .collect()
                 }),
-                sigma_doppler_hz: sigma_f,
-                sigma_phase_rad: sigma_phase,
-            };
+                sigma_f,
+                sigma_phase,
+            )?;
             for i in 0..n {
                 writeln!(
                     obs,
                     "{trial},{seed},{level},{},{:.16e},{},{true_frequency_bias:.16e},{true_phase_mean:.16e},{:.16e}",
                     (times[i] - epoch).as_seconds(),
-                    data.doppler_hz[i],
-                    data.phase_rad
+                    data.doppler_hz()[i],
+                    data.phase_rad()
                         .as_ref()
                         .map(|v| format!("{:.16e}", v[i]))
                         .unwrap_or_default(),
@@ -390,9 +387,8 @@ fn main() -> AnyResult<()> {
                 )?;
             }
             let batch_run = (|| -> AnyResult<()> {
-                let problem =
-                    PassiveRfProblem::new(config(epoch)?, data.clone(), prior.clone(), ou)?;
-                let fit = fit_passive_rf(&problem, &prior.mean, &lm_settings)?;
+                let problem = PassiveRfProblem::new(config(epoch)?, &data, &prior, ou)?;
+                let fit = fit_passive_rf(&problem, &prior.mean(), &lm_settings)?;
                 let sens = config(epoch)?.sample(
                     &DynVector::from_slice(&fit.parameters.as_slice()[..6]),
                     &times,
@@ -409,12 +405,12 @@ fn main() -> AnyResult<()> {
                 }
                 for i in 0..6 {
                     for j in 0..6 {
-                        f[(i, j)] = sens.stm[n - 1][(i, j)];
+                        f[(i, j)] = sens.stm()[n - 1][(i, j)];
                     }
                 }
                 let p_end = &f * &fit.covariance * f.transpose();
-                let x_end = sens.states[n - 1];
-                let p = sens.stm[n - 1] * p0 * sens.stm[n - 1].transpose();
+                let x_end = sens.states()[n - 1];
+                let p = sens.stm()[n - 1] * p0 * sens.stm()[n - 1].transpose();
                 let (pe, ve, ps, vs, nees) = metrics(&x_end, &p, &final_truth)?;
                 writeln!(
                     results,
@@ -435,8 +431,8 @@ fn main() -> AnyResult<()> {
                         history(
                             &mut histories,
                             (level, "batch", (times[i] - epoch).as_seconds()),
-                            &sens.states[i],
-                            &(sens.stm[i] * p0 * sens.stm[i].transpose()),
+                            &sens.states()[i],
+                            &(sens.stm()[i] * p0 * sens.stm()[i].transpose()),
                             &truth[i],
                             (
                                 fit.parameters[7] + fit.drift_rad.get(i).copied().unwrap_or(0.0),
@@ -507,8 +503,8 @@ fn main() -> AnyResult<()> {
                         for (solver, state, cov) in [
                             (
                                 "ekf",
-                                filter.steps()[i].x_updated,
-                                filter.steps()[i].p_updated,
+                                filter.steps().get(i).unwrap().x_updated,
+                                filter.steps().get(i).unwrap().p_updated,
                             ),
                             ("rts", smooth[i].0, smooth[i].1),
                         ] {

@@ -1,6 +1,8 @@
 //! A standalone geometric observation: no external ephemeris data is needed.
 use tychonic::kernels::{differential_doppler_partial, v3, v6_from};
 
+// Satkit settings copies are explicit at this external API boundary.
+#[allow(clippy::disallowed_methods)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let station_position = v3(6_378_137.0, 0.0, 0.0);
     let earth_rotation = v3(0.0, 0.0, tychonic::satkit::consts::OMEGA_EARTH);

@@ -4,10 +4,11 @@
 //! Dynamics use the same propagation configuration as the batch solver.
 //! Measurements use instantaneous partials, without chaining them with the STM.
 
+use super::FilterHistory;
 use crate::kernels::{
     Interferometer, KernelError, MeasurementKind, ParameterMode, PreparedBatch, PropagationConfig,
-    StationGeometry, V3, V6, az_el_partial_prepared, compute_sensitivities, propagate_with_stm,
-    r_of, range_rate_partial, v_of, wrap_pi,
+    StationGeometry, StationGeometrySource, V3, V6, az_el_partial_prepared, compute_sensitivities,
+    propagate_with_stm, r_of, range_rate_partial, v_of, wrap_pi,
 };
 use numeris::{
     Matrix, Vector,
@@ -73,26 +74,28 @@ where
 
 /// Range-rate, azimuth/elevation, or combined sensor using prepared geometry.
 /// `M = 1`: RR; `M = 2`: AZ, EL; `M = 3`: RR, AZ, EL.
-#[derive(Clone, Debug)]
-pub struct GroundSensor<const M: usize> {
-    geometry: StationGeometry,
+#[derive(Debug)]
+pub struct GroundSensor<'g, const M: usize> {
+    geometry: StationGeometrySource<'g>,
 }
 
-impl<const M: usize> GroundSensor<M> {
-    pub fn new(geometry: StationGeometry) -> crate::kernels::Result<Self> {
+impl<'g, const M: usize> GroundSensor<'g, M> {
+    pub fn new(geometry: impl Into<StationGeometrySource<'g>>) -> crate::kernels::Result<Self> {
         if !(1..=3).contains(&M) {
             return Err(KernelError::InvalidInput(
                 "ground sensor dimension must be 1, 2 or 3",
             ));
         }
-        Ok(Self { geometry })
+        Ok(Self {
+            geometry: geometry.into(),
+        })
     }
     pub fn geometry(&self) -> &StationGeometry {
         &self.geometry
     }
 }
 
-impl<const M: usize> MeasurementModel<M> for GroundSensor<M> {
+impl<const M: usize> MeasurementModel<M> for GroundSensor<'_, M> {
     fn evaluate(&self, state: &V6) -> crate::kernels::Result<(Vector<f64, M>, Matrix<f64, M, 6>)> {
         let g = &self.geometry;
         let mut predicted = Vector::zeros();
@@ -125,12 +128,12 @@ impl<const M: usize> MeasurementModel<M> for GroundSensor<M> {
 }
 
 /// Calibrated continuous phase sensor with a known nominal carrier/baseline.
-#[derive(Clone, Debug)]
-pub struct PhaseSensor {
-    pub geometry: StationGeometry,
+#[derive(Debug)]
+pub struct PhaseSensor<'g> {
+    pub geometry: StationGeometrySource<'g>,
     pub interferometer: Interferometer,
 }
-impl MeasurementModel<1> for PhaseSensor {
+impl MeasurementModel<1> for PhaseSensor<'_> {
     fn evaluate(&self, state: &V6) -> crate::kernels::Result<(Vector<f64, 1>, Matrix<f64, 1, 6>)> {
         let pred = self.interferometer.evaluate(state, &self.geometry, 0.0)?;
         let mut h = Matrix::zeros();
@@ -157,7 +160,7 @@ pub struct UpdateOptions {
     pub gate: Option<f64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct UpdateResult<const M: usize> {
     pub innovation: Vector<f64, M>,
     pub nis: f64,
@@ -172,7 +175,7 @@ pub struct OrbitEkf<const N: usize> {
     epoch: Instant,
     filter: Ekf<f64, N, 1>,
     timestamps: Vec<Instant>,
-    steps: Vec<EkfStep<f64, N>>,
+    steps: FilterHistory<N>,
 }
 
 impl<const N: usize> OrbitEkf<N> {
@@ -195,7 +198,7 @@ impl<const N: usize> OrbitEkf<N> {
             epoch,
             filter: Ekf::new(initial, covariance),
             timestamps: vec![epoch],
-            steps: vec![record(initial, covariance, Matrix::eye())],
+            steps: FilterHistory::new(record(initial, covariance, Matrix::eye())),
         })
     }
 
@@ -214,7 +217,7 @@ impl<const N: usize> OrbitEkf<N> {
 
     /// One record per distinct prediction epoch, including the initial epoch.
     /// Multiple updates at one epoch revise that record's updated state/covariance.
-    pub fn steps(&self) -> &[EkfStep<f64, N>] {
+    pub fn steps(&self) -> &FilterHistory<N> {
         &self.steps
     }
     pub fn timestamps(&self) -> &[Instant] {
@@ -224,7 +227,7 @@ impl<const N: usize> OrbitEkf<N> {
     /// Directly invokes numeris's built-in RTS smoother. Results align with
     /// `timestamps()`, including the initial prior epoch and prediction-only epochs.
     pub fn smooth(&self) -> EkfResult<SmoothedOrbit<N>> {
-        Ok(rts_smooth(&self.steps)?)
+        Ok(rts_smooth(&self.steps.to_records())?)
     }
 
     /// Predict forward with the local STM, relinearized at the latest estimate.
@@ -324,7 +327,7 @@ impl<const N: usize> OrbitEkf<N> {
         // angular/custom residuals without subtracting large predictions twice.
         let nis = candidate.update(&innovation, |_| Vector::zeros(), |_| h, r)?;
         if !nis.is_finite() {
-            return Err(KernelError::InvalidInput("innovation exceeds numeric range").into());
+            return Err(KernelError::Numerical("innovation exceeds numeric range").into());
         }
         let accepted = options.gate.is_none_or(|gate| nis <= gate);
         if accepted {
@@ -332,7 +335,7 @@ impl<const N: usize> OrbitEkf<N> {
             check_covariance(&candidate.p, true)?;
             self.filter.x = candidate.x;
             self.filter.p = candidate.p;
-            let last = self.steps.last_mut().expect("initial record exists");
+            let last = self.steps.current_mut();
             last.x_updated = candidate.x;
             last.p_updated = candidate.p;
         }
@@ -351,7 +354,12 @@ impl<const N: usize> OrbitEkf<N> {
         q: Option<&Matrix<f64, N, N>>,
         options: UpdateOptions,
     ) -> EkfResult<UpdateResult<M>> {
-        let saved = (self.filter.x, self.filter.p, self.epoch, self.steps.len());
+        let saved = (
+            self.filter.x,
+            self.filter.p,
+            self.epoch,
+            self.steps.checkpoint(),
+        );
         self.predict_to(observation.time, q)?;
         match self.update(
             &observation.value,
@@ -364,8 +372,8 @@ impl<const N: usize> OrbitEkf<N> {
                 self.filter.x = saved.0;
                 self.filter.p = saved.1;
                 self.epoch = saved.2;
-                self.steps.truncate(saved.3);
-                self.timestamps.truncate(saved.3);
+                self.steps.restore(saved.3);
+                self.timestamps.truncate(self.steps.len());
                 Err(error)
             }
         }
@@ -408,39 +416,7 @@ impl<const N: usize> OrbitEkf<N> {
             } else {
                 Some(process_noise(self.state(), self.epoch, time)?)
             };
-            let (nis, accepted) = match batch.kind() {
-                MeasurementKind::Joint => match batch.components() {
-                    1 => self.observe_joint_batch::<1>(batch, row, q.as_ref(), options)?,
-                    2 => self.observe_joint_batch::<2>(batch, row, q.as_ref(), options)?,
-                    3 => self.observe_joint_batch::<3>(batch, row, q.as_ref(), options)?,
-                    4 => self.observe_joint_batch::<4>(batch, row, q.as_ref(), options)?,
-                    5 => self.observe_joint_batch::<5>(batch, row, q.as_ref(), options)?,
-                    _ => unreachable!("validated joint dimension"),
-                },
-                MeasurementKind::PhaseDifference => {
-                    let (column, sigma) = batch.observation_column(0).unwrap();
-                    let observation = Observation {
-                        time,
-                        value: Vector::from_array([column[row]]),
-                        covariance: Matrix::new([[sigma * sigma]]),
-                        model: PhaseSensor {
-                            geometry: batch.geometry().row(row).unwrap().clone(),
-                            interferometer: batch.interferometer().unwrap(),
-                        },
-                    };
-                    let result = self.observe(&observation, q.as_ref(), options)?;
-                    (result.nis, result.accepted)
-                }
-                MeasurementKind::RangeRate => {
-                    self.observe_batch::<1>(batch, row, q.as_ref(), options)?
-                }
-                MeasurementKind::AzimuthElevation => {
-                    self.observe_batch::<2>(batch, row, q.as_ref(), options)?
-                }
-                MeasurementKind::Combined => {
-                    self.observe_batch::<3>(batch, row, q.as_ref(), options)?
-                }
-            };
+            let (nis, accepted) = self.observe_prepared_batch(batch, row, q.as_ref(), options)?;
             results.push(BatchUpdate {
                 time,
                 batch: batch_index,
@@ -452,6 +428,66 @@ impl<const N: usize> OrbitEkf<N> {
         Ok(results)
     }
 
+    fn observe_prepared_batch(
+        &mut self,
+        batch: &PreparedBatch,
+        row: usize,
+        q: Option<&Matrix<f64, N, N>>,
+        options: UpdateOptions,
+    ) -> EkfResult<(f64, bool)> {
+        Ok(match batch.kind() {
+            MeasurementKind::Joint => self.observe_joint_dimension(batch, row, q, options)?,
+            MeasurementKind::PhaseDifference => self.observe_phase_batch(batch, row, q, options)?,
+            MeasurementKind::RangeRate => self.observe_batch::<1>(batch, row, q, options)?,
+            MeasurementKind::AzimuthElevation => self.observe_batch::<2>(batch, row, q, options)?,
+            MeasurementKind::Combined => self.observe_batch::<3>(batch, row, q, options)?,
+        })
+    }
+    fn observe_phase_batch(
+        &mut self,
+        batch: &PreparedBatch,
+        row: usize,
+        q: Option<&Matrix<f64, N, N>>,
+        options: UpdateOptions,
+    ) -> EkfResult<(f64, bool)> {
+        let time = batch.timestamps()[row];
+        let (column, sigma) = batch
+            .observation_column(0)
+            .ok_or(KernelError::InvalidInput("phase observation column"))?;
+        let observation = Observation {
+            time,
+            value: Vector::from_array([column[row]]),
+            covariance: Matrix::new([[sigma * sigma]]),
+            model: PhaseSensor {
+                geometry: batch
+                    .geometry()
+                    .row(row)
+                    .ok_or(KernelError::InvalidInput("batch geometry row"))?
+                    .into(),
+                interferometer: batch
+                    .interferometer()
+                    .ok_or(KernelError::InvalidInput("phase interferometer"))?,
+            },
+        };
+        let result = self.observe(&observation, q, options)?;
+        Ok((result.nis, result.accepted))
+    }
+    fn observe_joint_dimension(
+        &mut self,
+        batch: &PreparedBatch,
+        row: usize,
+        q: Option<&Matrix<f64, N, N>>,
+        options: UpdateOptions,
+    ) -> EkfResult<(f64, bool)> {
+        Ok(match batch.components() {
+            1 => self.observe_joint_batch::<1>(batch, row, q, options)?,
+            2 => self.observe_joint_batch::<2>(batch, row, q, options)?,
+            3 => self.observe_joint_batch::<3>(batch, row, q, options)?,
+            4 => self.observe_joint_batch::<4>(batch, row, q, options)?,
+            5 => self.observe_joint_batch::<5>(batch, row, q, options)?,
+            _ => return Err(KernelError::InvalidInput("joint sensor dimension").into()),
+        })
+    }
     fn observe_joint_batch<const M: usize>(
         &mut self,
         batch: &PreparedBatch,
@@ -476,7 +512,7 @@ impl<const N: usize> OrbitEkf<N> {
         for i in 0..M {
             let (column, sigma) = batch
                 .observation_column(i)
-                .expect("batch kind matches sensor dimension");
+                .ok_or(KernelError::InvalidInput("batch sensor dimension"))?;
             value[i] = column[row];
             covariance[(i, i)] = sigma * sigma;
         }
@@ -488,8 +524,7 @@ impl<const N: usize> OrbitEkf<N> {
                 batch
                     .geometry()
                     .row(row)
-                    .expect("batch geometry row exists")
-                    .clone(),
+                    .ok_or(KernelError::InvalidInput("batch geometry row"))?,
             )?,
         };
         let result = self.observe(&observation, q, options)?;
@@ -497,7 +532,7 @@ impl<const N: usize> OrbitEkf<N> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct BatchUpdate {
     pub time: Instant,
     pub batch: usize,
@@ -514,19 +549,7 @@ pub fn white_acceleration_noise<const N: usize>(
     acceleration_psd: &V3,
     drag_psd: f64,
 ) -> crate::kernels::Result<Matrix<f64, N, N>> {
-    if !matches!(N, 6 | 7)
-        || !seconds.is_finite()
-        || seconds < 0.0
-        || !is_finite(acceleration_psd)
-        || acceleration_psd.as_slice().iter().any(|v| *v < 0.0)
-        || !drag_psd.is_finite()
-        || drag_psd < 0.0
-        || (N == 6 && drag_psd != 0.0)
-    {
-        return Err(KernelError::InvalidInput(
-            "process noise dimensions, duration or spectral densities",
-        ));
-    }
+    check_noise_inputs::<N>(seconds, acceleration_psd, drag_psd)?;
     let mut q = Matrix::zeros();
     for i in 0..3 {
         let velocity_variance = acceleration_psd[i] * seconds;
@@ -540,11 +563,32 @@ pub fn white_acceleration_noise<const N: usize>(
         q[(6, 6)] = drag_psd * seconds;
     }
     if !is_finite(&q) {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "process noise exceeds numeric range",
         ));
     }
     Ok(q)
+}
+
+fn check_noise_inputs<const N: usize>(
+    seconds: f64,
+    acceleration_psd: &V3,
+    drag_psd: f64,
+) -> crate::kernels::Result<()> {
+    if !matches!(N, 6 | 7)
+        || !seconds.is_finite()
+        || seconds < 0.0
+        || !is_finite(acceleration_psd)
+        || acceleration_psd.as_slice().iter().any(|v| *v < 0.0)
+        || !drag_psd.is_finite()
+        || drag_psd < 0.0
+        || (N == 6 && drag_psd != 0.0)
+    {
+        return Err(KernelError::InvalidInput(
+            "process noise dimensions, duration or spectral densities",
+        ));
+    }
+    Ok(())
 }
 
 fn record<const N: usize>(
@@ -586,53 +630,71 @@ pub(super) fn check_covariance<const N: usize>(
     p: &Matrix<f64, N, N>,
     positive: bool,
 ) -> crate::kernels::Result<()> {
-    let invalid = || {
-        KernelError::InvalidInput(
-            "covariance must be finite, symmetric and positive (semi)definite",
-        )
-    };
     if N == 0 || !is_finite(p) {
-        return Err(invalid());
+        return Err(invalid_covariance());
     }
-    let mut scaled = Matrix::<f64, N, N>::zeros();
-    for i in 0..N {
-        if p[(i, i)] < 0.0 || (positive && p[(i, i)] == 0.0) {
-            return Err(invalid());
-        }
-        for j in 0..N {
-            if (p[(i, j)] - p[(j, i)]).abs() > 1e-12 * p[(i, j)].abs().max(p[(j, i)].abs()) {
-                return Err(invalid());
-            }
-            if p[(i, i)] == 0.0 || p[(j, j)] == 0.0 {
-                if p[(i, j)] != 0.0 {
-                    return Err(invalid());
-                }
-            } else {
-                scaled[(i, j)] = p[(i, j)] / p[(i, i)].sqrt() / p[(j, j)].sqrt();
-            }
-        }
-    }
+    let mut scaled = scale_covariance(p, positive)?;
     if !is_finite(&scaled) {
-        return Err(invalid());
+        return Err(invalid_covariance());
     }
     if positive {
-        scaled.cholesky().map_err(|_| invalid())?;
+        scaled.cholesky().map_err(|_| invalid_covariance())?;
     } else {
-        // Schur complements also admit zero pivots for rank-deficient Q.
-        for k in 0..N {
-            let pivot = scaled[(k, k)];
-            if pivot < -1e-12 {
-                return Err(invalid());
+        check_semidefinite(&mut scaled)?;
+    }
+    Ok(())
+}
+fn invalid_covariance() -> KernelError {
+    KernelError::InvalidInput("covariance must be finite, symmetric and positive (semi)definite")
+}
+fn scale_covariance<const N: usize>(
+    p: &Matrix<f64, N, N>,
+    positive: bool,
+) -> crate::kernels::Result<Matrix<f64, N, N>> {
+    let mut scaled = Matrix::zeros();
+    for i in 0..N {
+        if p[(i, i)] < 0.0 || (positive && p[(i, i)] == 0.0) {
+            return Err(invalid_covariance());
+        }
+        for j in 0..N {
+            scaled[(i, j)] = scale_covariance_entry(p, i, j)?;
+        }
+    }
+    Ok(scaled)
+}
+fn scale_covariance_entry<const N: usize>(
+    p: &Matrix<f64, N, N>,
+    i: usize,
+    j: usize,
+) -> crate::kernels::Result<f64> {
+    if (p[(i, j)] - p[(j, i)]).abs() > 1e-12 * p[(i, j)].abs().max(p[(j, i)].abs()) {
+        return Err(invalid_covariance());
+    }
+    if p[(i, i)] == 0.0 || p[(j, j)] == 0.0 {
+        if p[(i, j)] != 0.0 {
+            return Err(invalid_covariance());
+        }
+        return Ok(0.0);
+    }
+    Ok(p[(i, j)] / p[(i, i)].sqrt() / p[(j, j)].sqrt())
+}
+fn check_semidefinite<const N: usize>(
+    scaled: &mut Matrix<f64, N, N>,
+) -> crate::kernels::Result<()> {
+    // Schur complements admit zero pivots for rank-deficient process noise.
+    for k in 0..N {
+        let pivot = scaled[(k, k)];
+        if pivot < -1e-12 {
+            return Err(invalid_covariance());
+        }
+        if pivot <= 0.0 {
+            if (k + 1..N).any(|i| scaled[(i, k)].abs() > 1e-12) {
+                return Err(invalid_covariance());
             }
-            if pivot <= 0.0 {
-                if (k + 1..N).any(|i| scaled[(i, k)].abs() > 1e-12) {
-                    return Err(invalid());
-                }
-            } else {
-                for i in k + 1..N {
-                    for j in k + 1..N {
-                        scaled[(i, j)] -= scaled[(i, k)] * scaled[(k, j)] / pivot;
-                    }
+        } else {
+            for i in k + 1..N {
+                for j in k + 1..N {
+                    scaled[(i, j)] -= scaled[(i, k)] * scaled[(k, j)] / pivot;
                 }
             }
         }

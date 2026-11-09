@@ -8,6 +8,18 @@
 //! [`numeris`] and [`satkit`] are re-exported so downstream projects can use
 //! exactly the matrix, time and propagation types accepted by this library.
 #![doc = include_str!("../README.md")]
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::disallowed_types,
+        clippy::disallowed_methods
+    )
+)]
 pub use numeris;
 pub use satkit;
 pub mod estimate;

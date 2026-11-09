@@ -23,7 +23,7 @@ impl ParameterMode {
 }
 
 /// Validated, immutable propagation configuration shared by all models.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PropagationConfig {
     reference_epoch: Instant,
     settings: PropSettings,
@@ -36,6 +36,9 @@ impl PropagationConfig {
         settings: PropSettings,
         mode: ParameterMode,
     ) -> Result<Self> {
+        if reference_epoch == Instant::INVALID {
+            return Err(KernelError::InvalidInput("reference epoch must be valid"));
+        }
         check_stm_settings(&settings)?;
         match mode {
             ParameterMode::StateOnly { fixed_drag } => check_drag_value(fixed_drag)?,
@@ -114,6 +117,7 @@ pub fn od_prop_settings() -> PropSettings {
 }
 
 pub(crate) fn check_stm_settings(settings: &PropSettings) -> Result<()> {
+    check_propagation_settings(settings)?;
     if matches!(
         settings.integrator,
         Integrator::RODAS4 | Integrator::GaussJackson8
@@ -130,6 +134,50 @@ pub(crate) fn check_stm_settings(settings: &PropSettings) -> Result<()> {
     Ok(())
 }
 
+fn check_epochs(reference: &Instant, times: &[Instant]) -> Result<()> {
+    if *reference == Instant::INVALID || times.contains(&Instant::INVALID) {
+        return Err(KernelError::InvalidInput(
+            "propagation epochs must be valid",
+        ));
+    }
+    Ok(())
+}
+
+fn check_propagation_settings(settings: &PropSettings) -> Result<()> {
+    settings.validate_gravity()?;
+    if settings.max_steps == 0 {
+        return Err(KernelError::InvalidInput(
+            "integration step limit must be positive",
+        ));
+    }
+    if settings.integrator == Integrator::GaussJackson8 {
+        return check_step(settings.gj_step_seconds);
+    }
+    if ![settings.abs_error, settings.rel_error]
+        .iter()
+        .all(|t| t.is_finite() && *t >= 0.0)
+        || (settings.abs_error == 0.0 && settings.rel_error == 0.0)
+    {
+        return Err(KernelError::InvalidInput(
+            "integration tolerances must be finite, nonnegative and not both zero",
+        ));
+    }
+    if let Some(step) = settings.initial_step_secs {
+        check_step(step)?;
+    }
+    Ok(())
+}
+
+fn check_step(step: f64) -> Result<()> {
+    // Satkit takes the magnitude and derives the direction from the epochs.
+    if !step.is_finite() || step == 0.0 {
+        return Err(KernelError::InvalidInput(
+            "integration step must be finite and nonzero",
+        ));
+    }
+    Ok(())
+}
+
 pub fn propagate_state(
     x: &V6,
     from: &Instant,
@@ -137,6 +185,8 @@ pub fn propagate_state(
     settings: &PropSettings,
     props: &SatPropertiesSimple,
 ) -> Result<V6> {
+    check_epochs(from, &[*to])?;
+    check_propagation_settings(settings)?;
     check_state(x)?;
     if !props.cdaoverm.is_finite()
         || props.cdaoverm < 0.0
@@ -161,6 +211,7 @@ pub fn propagate_with_stm(
     settings: &PropSettings,
     cda_over_m: f64,
 ) -> Result<(V6, M6)> {
+    check_epochs(from, &[*to])?;
     check_state(x)?;
     check_stm_settings(settings)?;
     check_drag_value(cda_over_m)?;
@@ -171,7 +222,7 @@ pub fn propagate_with_stm(
     let stm = out.block::<6, 6>(0, 1);
     check_state(&state)?;
     if !finite(&stm) {
-        return Err(KernelError::InvalidInput("non-finite propagated STM"));
+        return Err(KernelError::Numerical("non-finite propagated STM"));
     }
     Ok((state, stm))
 }
@@ -197,16 +248,78 @@ pub(crate) fn check_drag(cda: f64, step: f64) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Sensitivities {
-    pub timestamps: Vec<Instant>,
-    pub states: Vec<V6>,
-    pub stm: Vec<M6>,
+    pub(crate) timestamps: Vec<Instant>,
+    pub(crate) states: Vec<V6>,
+    pub(crate) stm: Vec<M6>,
     /// ∂x(t_i)/∂(C_d A/m). Empty for state-only sampling.
-    pub state_dcd: Vec<V6>,
+    pub(crate) state_dcd: Vec<V6>,
 }
 
 impl Sensitivities {
+    /// Consume externally sampled arrays and establish alignment and finiteness.
+    pub fn new(
+        timestamps: Vec<Instant>,
+        states: Vec<V6>,
+        stm: Vec<M6>,
+        state_dcd: Vec<V6>,
+    ) -> Result<Self> {
+        let value = Self {
+            timestamps,
+            states,
+            stm,
+            state_dcd,
+        };
+        value.columns()?;
+        if value.timestamps.contains(&Instant::INVALID)
+            || !value.states.iter().all(finite)
+            || !value.stm.iter().all(finite)
+            || !value.state_dcd.iter().all(finite)
+        {
+            return Err(KernelError::InvalidInput(
+                "sensitivity epochs and values must be valid and finite",
+            ));
+        }
+        Ok(value)
+    }
+    pub fn timestamps(&self) -> &[Instant] {
+        &self.timestamps
+    }
+    pub fn states(&self) -> &[V6] {
+        &self.states
+    }
+    pub fn stm(&self) -> &[M6] {
+        &self.stm
+    }
+    pub fn state_dcd(&self) -> &[V6] {
+        &self.state_dcd
+    }
+    /// Move buffers out when preparing a different validated sample set.
+    pub fn into_parts(self) -> (Vec<Instant>, Vec<V6>, Vec<M6>, Vec<V6>) {
+        (self.timestamps, self.states, self.stm, self.state_dcd)
+    }
+    pub fn row(&self, i: usize) -> Option<SensitivityRow<'_>> {
+        Some(SensitivityRow {
+            time: *self.timestamps.get(i)?,
+            state: self.states.get(i)?,
+            stm: self.stm.get(i)?,
+            state_dcd: self.state_dcd.get(i),
+        })
+    }
+    pub fn iter_rows(&self) -> impl ExactSizeIterator<Item = SensitivityRow<'_>> {
+        self.timestamps
+            .iter()
+            .zip(&self.states)
+            .zip(&self.stm)
+            .enumerate()
+            .map(|(i, ((time, state), stm))| SensitivityRow {
+                time: *time,
+                state,
+                stm,
+                state_dcd: self.state_dcd.get(i),
+            })
+    }
     /// Checks array dimensions; finite values are checked at composition time.
     pub fn columns(&self) -> Result<usize> {
         let n = self.timestamps.len();
@@ -219,6 +332,27 @@ impl Sensitivities {
             ));
         }
         Ok(if self.state_dcd.is_empty() { 6 } else { 7 })
+    }
+
+    // Lengths are private and aligned. Epoch equality proves every selected
+    // index also exists in states, STMs and (when present) drag derivatives.
+    pub(crate) fn validate_mapping(
+        &self,
+        times: &[Instant],
+        mapping: Option<&[usize]>,
+    ) -> Result<()> {
+        if mapping.is_some_and(|indices| indices.len() != times.len()) {
+            return Err(KernelError::InvalidInput("sensitivity mapping dimensions"));
+        }
+        for (i, time) in times.iter().enumerate() {
+            let index = mapping.map_or(i, |indices| indices[i]);
+            if self.timestamps.get(index) != Some(time) {
+                return Err(KernelError::InvalidInput(
+                    "sensitivity and geometry epochs do not match",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// EKF transition for a constant drag parameter: [Φ, dx/d(C_d A/m); 0, 1].
@@ -240,8 +374,18 @@ impl Sensitivities {
     }
 }
 
+/// Aligned borrow of one sampled state and its derivatives.
+pub struct SensitivityRow<'a> {
+    pub time: Instant,
+    pub state: &'a V6,
+    pub stm: &'a M6,
+    pub state_dcd: Option<&'a V6>,
+}
+
 /// Evaluate one or two complete arcs with dense output, then sample in the
 /// caller's order. Supports unsorted, duplicate, forward and backward epochs.
+// External API boundary: Satkit requires an owned settings/TLE copy.
+#[allow(clippy::disallowed_methods)]
 fn sample_arc<const C: usize>(
     x: &Matrix<f64, 6, C>,
     epoch: &Instant,
@@ -249,6 +393,7 @@ fn sample_arc<const C: usize>(
     settings: &PropSettings,
     props: &SatPropertiesSimple,
 ) -> Result<Vec<Matrix<f64, 6, C>>> {
+    check_epochs(epoch, times)?;
     let mut samples = vec![*x; times.len()];
     for forward in [false, true] {
         let end = times
@@ -307,7 +452,7 @@ pub fn compute_state_transitions(
         let phi = sample.block::<6, 6>(0, 1);
         check_state(&state)?;
         if !finite(&phi) {
-            return Err(KernelError::InvalidInput("non-finite propagated STM"));
+            return Err(KernelError::Numerical("non-finite propagated STM"));
         }
         sens.states.push(state);
         sens.stm.push(phi);
@@ -377,9 +522,7 @@ pub fn compute_sensitivities(
         };
         check_state(&state)?;
         if !finite(&stm) || !finite(&derivative) {
-            return Err(KernelError::InvalidInput(
-                "non-finite propagated sensitivity",
-            ));
+            return Err(KernelError::Numerical("non-finite propagated sensitivity"));
         }
         sens.states.push(state);
         sens.stm.push(stm);
@@ -388,15 +531,60 @@ pub fn compute_sensitivities(
     Ok(sens)
 }
 
+// External API boundary: Satkit requires an owned settings/TLE copy.
+
+#[allow(clippy::disallowed_methods)]
 pub fn initial_state_from_tle(tle: &TLE, epoch: &Instant) -> Result<V6> {
+    check_epochs(&tle.epoch, &[*epoch])?;
     let mut tle = tle.clone();
     let out = sgp4(&mut tle, &[*epoch]).map_err(|e| KernelError::Tle(e.to_string()))?;
-    if out.errcode[0] != SGP4Error::SGP4Success {
-        return Err(KernelError::Tle(out.errcode[0].to_string()));
+    // Satkit's one-epoch API returns one position, velocity and status column.
+    // Check that boundary before using the fixed column index.
+    let status = out
+        .errcode
+        .first()
+        .ok_or(KernelError::Numerical("missing SGP4 status"))?;
+    if *status != SGP4Error::SGP4Success {
+        return Err(KernelError::Tle(status.to_string()));
+    }
+    if out.pos.nrows() != 3 || out.vel.nrows() != 3 || out.pos.ncols() != 1 || out.vel.ncols() != 1
+    {
+        return Err(KernelError::Numerical("SGP4 output dimensions"));
     }
     let r = V3::from_slice(out.pos.col_slice(0));
     let v = V3::from_slice(out.vel.col_slice(0));
     let (r, v) = frametransform::transform_state(Frame::TEME, Frame::GCRF, epoch, &r, &v)
         .map_err(KernelError::Frame)?;
-    Ok(v6_from(&r, &v))
+    let state = v6_from(&r, &v);
+    check_state(&state)?;
+    Ok(state)
+}
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+    #[test]
+    fn imported_samples_and_epoch_mappings_are_checked() {
+        let time = Instant::from_datetime(2024, 1, 1, 0, 0, 0.0).unwrap();
+        let samples =
+            Sensitivities::new(vec![time], vec![V6::zeros()], vec![M6::eye()], vec![]).unwrap();
+        assert!(
+            samples
+                .validate_mapping(&[time], Some(&[usize::MAX]))
+                .is_err()
+        );
+        assert!(samples.validate_mapping(&[time], Some(&[])).is_err());
+        assert!(samples.validate_mapping(&[time], Some(&[0])).is_ok());
+        assert_eq!(samples.iter_rows().len(), 1);
+        assert!(samples.row(1).is_none());
+        assert!(
+            Sensitivities::new(
+                vec![Instant::INVALID],
+                vec![V6::zeros()],
+                vec![M6::eye()],
+                vec![]
+            )
+            .is_err()
+        );
+    }
 }

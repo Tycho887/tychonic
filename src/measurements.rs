@@ -8,9 +8,9 @@
 use crate::estimate::{MeasurementModel, Observation, OrbitEkf};
 use crate::kernels::*;
 use crate::optim::{FitError, FitResult, ODProblem, fit_lm};
-use numeris::{DynMatrix, DynVector, Matrix, Vector, optim::LmSettings};
+use numeris::{DynMatrix, DynVector, Matrix, Vector, dynmatrix::DynCholesky, optim::LmSettings};
 use satkit::Instant;
-use std::sync::Arc;
+use std::ops::Deref;
 
 mod rf;
 pub use rf::{GaussianPrior, RfBuilder, RfPriors};
@@ -48,6 +48,24 @@ impl Observable {
             Self::AzimuthElevation => 3,
         }
     }
+    fn validate(self) -> Result<()> {
+        match self {
+            Self::Doppler {
+                carrier_hz,
+                offset_hz,
+            } if !carrier_hz.is_finite() || carrier_hz <= 0.0 || !offset_hz.is_finite() => {
+                Err(KernelError::InvalidInput("Doppler carrier/offset"))
+            }
+            Self::PhaseDifference {
+                frequency_offset_hz,
+                phase_offset_rad,
+                ..
+            } if !frequency_offset_hz.is_finite() || !phase_offset_rad.is_finite() => {
+                Err(KernelError::InvalidInput("phase calibration offsets"))
+            }
+            _ => Ok(()),
+        }
+    }
     fn dimension(self) -> usize {
         if matches!(self, Self::AzimuthElevation) {
             2
@@ -57,8 +75,8 @@ impl Observable {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct Model(Arc<[Observable]>);
+#[derive(Debug)]
+pub(crate) struct Model(Box<[Observable]>);
 
 impl Model {
     fn new(mut observables: Vec<Observable>) -> Result<Self> {
@@ -70,22 +88,7 @@ impl Model {
             return Err(KernelError::InvalidInput("duplicate observable selection"));
         }
         for observable in &observables {
-            match *observable {
-                Observable::Doppler {
-                    carrier_hz,
-                    offset_hz,
-                } if !carrier_hz.is_finite() || carrier_hz <= 0.0 || !offset_hz.is_finite() => {
-                    return Err(KernelError::InvalidInput("Doppler carrier/offset"));
-                }
-                Observable::PhaseDifference {
-                    frequency_offset_hz,
-                    phase_offset_rad,
-                    ..
-                } if !frequency_offset_hz.is_finite() || !phase_offset_rad.is_finite() => {
-                    return Err(KernelError::InvalidInput("phase calibration offsets"));
-                }
-                _ => {}
-            }
+            observable.validate()?;
         }
         Ok(Self(observables.into()))
     }
@@ -158,7 +161,7 @@ impl Model {
             .chain(partial.as_slice())
             .all(|v| v.is_finite())
         {
-            return Err(KernelError::InvalidInput(
+            return Err(KernelError::Numerical(
                 "measurement prediction exceeds numeric range",
             ));
         }
@@ -166,16 +169,31 @@ impl Model {
     }
 }
 
+#[derive(Debug)]
+enum ModelSource<'g> {
+    Owned(Model),
+    Borrowed(&'g Model),
+}
+impl Deref for ModelSource<'_> {
+    type Target = Model;
+    fn deref(&self) -> &Model {
+        match self {
+            Self::Owned(model) => model,
+            Self::Borrowed(model) => model,
+        }
+    }
+}
+
 /// Instantaneous calibrated sensor, suitable for `OrbitEkf::observe` or `update`.
 /// Use the named sensor constructors for one observable, or `joint_sensor` for fusion.
-#[derive(Clone, Debug)]
-pub struct CalibratedSensor<const M: usize> {
-    model: Model,
-    geometry: StationGeometry,
+#[derive(Debug)]
+pub struct CalibratedSensor<'g, const M: usize> {
+    model: ModelSource<'g>,
+    geometry: StationGeometrySource<'g>,
     time: Instant,
 }
 
-impl<const M: usize> MeasurementModel<M> for CalibratedSensor<M> {
+impl<const M: usize> MeasurementModel<M> for CalibratedSensor<'_, M> {
     fn evaluate(&self, state: &V6) -> Result<(Vector<f64, M>, Matrix<f64, M, 6>)> {
         let (value, partial) = self.model.predict(state, &self.geometry, self.time)?;
         let mut v = Vector::zeros();
@@ -199,11 +217,11 @@ impl<const M: usize> MeasurementModel<M> for CalibratedSensor<M> {
 
 /// Prepare a joint sensor. `M` must equal the selected component count (1–5).
 /// Geometry must have been prepared for `time`.
-pub fn joint_sensor<const M: usize>(
-    geometry: StationGeometry,
+pub fn joint_sensor<'g, const M: usize>(
+    geometry: impl Into<StationGeometrySource<'g>>,
     time: Instant,
     observables: Vec<Observable>,
-) -> Result<CalibratedSensor<M>> {
+) -> Result<CalibratedSensor<'g, M>> {
     let model = Model::new(observables)?;
     if M != model.dimension() {
         return Err(KernelError::InvalidInput(
@@ -211,17 +229,17 @@ pub fn joint_sensor<const M: usize>(
         ));
     }
     Ok(CalibratedSensor {
-        model,
-        geometry,
+        model: ModelSource::Owned(model),
+        geometry: geometry.into(),
         time,
     })
 }
 
-pub fn doppler_sensor(
-    geometry: StationGeometry,
+pub fn doppler_sensor<'g>(
+    geometry: impl Into<StationGeometrySource<'g>>,
     time: Instant,
     carrier_hz: f64,
-) -> Result<CalibratedSensor<1>> {
+) -> Result<CalibratedSensor<'g, 1>> {
     joint_sensor(
         geometry,
         time,
@@ -231,11 +249,11 @@ pub fn doppler_sensor(
         }],
     )
 }
-pub fn phase_difference_sensor(
-    geometry: StationGeometry,
+pub fn phase_difference_sensor<'g>(
+    geometry: impl Into<StationGeometrySource<'g>>,
     time: Instant,
     interferometer: Interferometer,
-) -> Result<CalibratedSensor<1>> {
+) -> Result<CalibratedSensor<'g, 1>> {
     joint_sensor(
         geometry,
         time,
@@ -246,21 +264,21 @@ pub fn phase_difference_sensor(
         }],
     )
 }
-pub fn differential_doppler_sensor(
-    geometry: StationGeometry,
+pub fn differential_doppler_sensor<'g>(
+    geometry: impl Into<StationGeometrySource<'g>>,
     time: Instant,
     interferometer: Interferometer,
-) -> Result<CalibratedSensor<1>> {
+) -> Result<CalibratedSensor<'g, 1>> {
     joint_sensor(
         geometry,
         time,
         vec![Observable::DifferentialDoppler { interferometer }],
     )
 }
-pub fn azimuth_elevation_sensor(
-    geometry: StationGeometry,
+pub fn azimuth_elevation_sensor<'g>(
+    geometry: impl Into<StationGeometrySource<'g>>,
     time: Instant,
-) -> Result<CalibratedSensor<2>> {
+) -> Result<CalibratedSensor<'g, 2>> {
     joint_sensor(geometry, time, vec![Observable::AzimuthElevation])
 }
 
@@ -268,12 +286,13 @@ pub fn azimuth_elevation_sensor(
 /// Each values row and covariance uses canonical component order, regardless of
 /// the order of `observables`. Covariances must be symmetric positive definite.
 /// Different schedules should be supplied as separate batches to `fit`/`filter_batches`.
-pub fn joint(
-    geometry: Arc<PreparedGeometry>,
+pub fn joint<'g>(
+    geometry: impl Into<GeometrySource<'g>>,
     observables: Vec<Observable>,
     values: Vec<Vec<f64>>,
     covariances: Vec<DynMatrix<f64>>,
-) -> Result<PreparedBatch> {
+) -> Result<PreparedBatch<'g>> {
+    let geometry = geometry.into();
     let model = Model::new(observables)?;
     let m = model.dimension();
     if geometry.is_empty()
@@ -291,58 +310,61 @@ pub fn joint(
         .len()
         .checked_mul(m)
         .ok_or(KernelError::InvalidInput("output dimensions overflow"))?;
-    let mut lower = Vec::with_capacity(covariances.len());
-    for covariance in &covariances {
-        if covariance.nrows() != m
-            || covariance.ncols() != m
-            || !covariance.as_slice().iter().all(|v| v.is_finite())
-        {
-            return Err(KernelError::InvalidInput(
-                "joint covariance dimensions/values",
-            ));
-        }
-        for i in 0..m {
-            for j in 0..i {
-                let scale = covariance[(i, i)].abs().sqrt() * covariance[(j, j)].abs().sqrt();
-                if (covariance[(i, j)] - covariance[(j, i)]).abs() > 1e-12 * scale {
-                    return Err(KernelError::InvalidInput(
-                        "joint covariance must be symmetric",
-                    ));
-                }
-            }
-        }
-        lower.push(
-            covariance
-                .cholesky()
-                .map_err(|_| {
-                    KernelError::InvalidInput("joint covariance must be positive definite")
-                })?
-                .l()
-                .clone(),
-        );
-    }
+    let epochs = covariances
+        .into_iter()
+        .map(|covariance| {
+            let factor = factor_covariance(&covariance, m)?;
+            Ok(NoiseAtEpoch { covariance, factor })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(PreparedBatch::from_joint(
         geometry,
         JointBatch {
             model,
             values,
-            covariances,
-            lower,
+            noise: Noise::PerEpoch(epochs),
         },
     ))
 }
 
-fn independent(
-    geometry: Arc<PreparedGeometry>,
+fn factor_covariance(covariance: &DynMatrix<f64>, m: usize) -> Result<DynCholesky<f64>> {
+    if covariance.nrows() != m
+        || covariance.ncols() != m
+        || !covariance.as_slice().iter().all(|v| v.is_finite())
+    {
+        return Err(KernelError::InvalidInput(
+            "joint covariance dimensions/values",
+        ));
+    }
+    for i in 0..m {
+        for j in 0..i {
+            let scale = covariance[(i, i)].abs().sqrt() * covariance[(j, j)].abs().sqrt();
+            if (covariance[(i, j)] - covariance[(j, i)]).abs() > 1e-12 * scale {
+                return Err(KernelError::InvalidInput(
+                    "joint covariance must be symmetric",
+                ));
+            }
+        }
+    }
+    covariance
+        .cholesky()
+        .map_err(|_| KernelError::InvalidInput("joint covariance must be positive definite"))
+}
+
+fn valid_noise_sigma(sigma: f64) -> bool {
+    sigma.is_finite() && sigma > 0.0 && sigma.powi(2).is_finite() && sigma.powi(2) != 0.0
+}
+
+fn independent<'g>(
+    geometry: impl Into<GeometrySource<'g>>,
     observables: Vec<Observable>,
     columns: Vec<Vec<f64>>,
     sigmas: &[f64],
-) -> Result<PreparedBatch> {
+) -> Result<PreparedBatch<'g>> {
+    let geometry = geometry.into();
     if columns.iter().any(|c| c.len() != geometry.len())
         || sigmas.len() != columns.len()
-        || sigmas
-            .iter()
-            .any(|s| !s.is_finite() || *s <= 0.0 || !s.powi(2).is_finite() || s.powi(2) == 0.0)
+        || sigmas.iter().any(|s| !valid_noise_sigma(*s))
     {
         return Err(KernelError::InvalidInput(
             "observation lengths or noise sigmas",
@@ -355,17 +377,35 @@ fn independent(
     for (i, sigma) in sigmas.iter().enumerate() {
         covariance[(i, i)] = sigma.powi(2);
     }
-    let covariances = vec![covariance; geometry.len()];
-    joint(geometry, observables, values, covariances)
+    let model = Model::new(observables)?;
+    if geometry.is_empty() || model.dimension() != columns.len() {
+        return Err(KernelError::InvalidInput("joint observation dimensions"));
+    }
+    if columns.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(KernelError::InvalidInput("observations must be finite"));
+    }
+    geometry
+        .len()
+        .checked_mul(model.dimension())
+        .ok_or(KernelError::InvalidInput("output dimensions overflow"))?;
+    let factor = factor_covariance(&covariance, model.dimension())?;
+    Ok(PreparedBatch::from_joint(
+        geometry,
+        JointBatch {
+            model,
+            values,
+            noise: Noise::Shared(NoiseAtEpoch { covariance, factor }),
+        },
+    ))
 }
 
 /// Carrier-relative Doppler in Hz; receiver/transmitter offset already calibrated.
-pub fn doppler(
-    geometry: Arc<PreparedGeometry>,
+pub fn doppler<'g>(
+    geometry: impl Into<GeometrySource<'g>>,
     carrier_hz: f64,
     values_hz: Vec<f64>,
     sigma_hz: f64,
-) -> Result<PreparedBatch> {
+) -> Result<PreparedBatch<'g>> {
     independent(
         geometry,
         vec![Observable::Doppler {
@@ -377,12 +417,12 @@ pub fn doppler(
     )
 }
 /// Continuous, unwrapped phase difference in radians, with calibrated offsets.
-pub fn phase_difference(
-    geometry: Arc<PreparedGeometry>,
+pub fn phase_difference<'g>(
+    geometry: impl Into<GeometrySource<'g>>,
     interferometer: Interferometer,
     values_rad: Vec<f64>,
     sigma_rad: f64,
-) -> Result<PreparedBatch> {
+) -> Result<PreparedBatch<'g>> {
     independent(
         geometry,
         vec![Observable::PhaseDifference {
@@ -395,12 +435,12 @@ pub fn phase_difference(
     )
 }
 /// Signed f1 − f2 in Hz. No ordinary Doppler or phase observations are required.
-pub fn differential_doppler(
-    geometry: Arc<PreparedGeometry>,
+pub fn differential_doppler<'g>(
+    geometry: impl Into<GeometrySource<'g>>,
     interferometer: Interferometer,
     values_hz: Vec<f64>,
     sigma_hz: f64,
-) -> Result<PreparedBatch> {
+) -> Result<PreparedBatch<'g>> {
     independent(
         geometry,
         vec![Observable::DifferentialDoppler { interferometer }],
@@ -409,13 +449,13 @@ pub fn differential_doppler(
     )
 }
 /// Azimuth eastward from north and elevation in radians.
-pub fn azimuth_elevation(
-    geometry: Arc<PreparedGeometry>,
+pub fn azimuth_elevation<'g>(
+    geometry: impl Into<GeometrySource<'g>>,
     azimuth_rad: Vec<f64>,
     elevation_rad: Vec<f64>,
     sigma_az_rad: f64,
     sigma_el_rad: f64,
-) -> Result<PreparedBatch> {
+) -> Result<PreparedBatch<'g>> {
     independent(
         geometry,
         vec![Observable::AzimuthElevation],
@@ -439,7 +479,7 @@ pub fn doppler_differential_covariance(
     let b = sigma_antenna2_hz.powi(2);
     let r = Matrix::new([[a, a], [a, a + b]]);
     if !r.as_slice().iter().all(|v| v.is_finite()) || r.cholesky().is_err() {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "antenna covariance exceeds numeric range",
         ));
     }
@@ -447,29 +487,47 @@ pub fn doppler_differential_covariance(
 }
 
 /// Fit prepared passive batches from an existing orbit guess using numeris defaults.
-pub fn fit(
+pub fn fit<'g>(
     config: PropagationConfig,
-    batches: Vec<PreparedBatch>,
+    batches: impl Into<crate::optim::BatchSource<'g>>,
     guess: &DynVector<f64>,
 ) -> std::result::Result<FitResult, FitError> {
     fit_with_options(config, batches, guess, None, &LmSettings::default())
 }
-pub fn fit_with_options(
+pub fn fit_with_options<'g>(
     config: PropagationConfig,
-    batches: Vec<PreparedBatch>,
+    batches: impl Into<crate::optim::BatchSource<'g>>,
     guess: &DynVector<f64>,
     scales: Option<&[f64]>,
     settings: &LmSettings<f64>,
 ) -> std::result::Result<FitResult, FitError> {
-    fit_lm(ODProblem::new(config, batches)?, guess, scales, settings)
+    fit_lm(&ODProblem::new(config, batches)?, guess, scales, settings)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct JointBatch {
     model: Model,
     values: Vec<Vec<f64>>,
-    covariances: Vec<DynMatrix<f64>>,
-    lower: Vec<DynMatrix<f64>>,
+    noise: Noise,
+}
+
+#[derive(Debug)]
+struct NoiseAtEpoch {
+    covariance: DynMatrix<f64>,
+    factor: DynCholesky<f64>,
+}
+#[derive(Debug)]
+enum Noise {
+    Shared(NoiseAtEpoch),
+    PerEpoch(Vec<NoiseAtEpoch>),
+}
+impl Noise {
+    fn row(&self, row: usize) -> &NoiseAtEpoch {
+        match self {
+            Self::Shared(noise) => noise,
+            Self::PerEpoch(epochs) => &epochs[row],
+        }
+    }
 }
 
 impl JointBatch {
@@ -477,11 +535,11 @@ impl JointBatch {
         self.model.dimension()
     }
 
-    pub(crate) fn observation<const M: usize>(
-        &self,
-        geometry: &PreparedGeometry,
+    pub(crate) fn observation<'g, const M: usize>(
+        &'g self,
+        geometry: &'g PreparedGeometry,
         row: usize,
-    ) -> Result<Observation<M, CalibratedSensor<M>>> {
+    ) -> Result<Observation<M, CalibratedSensor<'g, M>>> {
         if M != self.dimension() || row >= geometry.len() {
             return Err(KernelError::InvalidInput("joint observation row/dimension"));
         }
@@ -490,7 +548,7 @@ impl JointBatch {
         for i in 0..M {
             value[i] = self.values[row][i];
             for j in 0..M {
-                covariance[(i, j)] = self.covariances[row][(i, j)];
+                covariance[(i, j)] = self.noise.row(row).covariance[(i, j)];
             }
         }
         Ok(Observation {
@@ -498,8 +556,12 @@ impl JointBatch {
             value,
             covariance,
             model: CalibratedSensor {
-                model: self.model.clone(),
-                geometry: geometry.row(row).unwrap().clone(),
+                model: ModelSource::Borrowed(&self.model),
+                geometry: StationGeometrySource::Borrowed(
+                    geometry
+                        .row(row)
+                        .ok_or(KernelError::InvalidInput("joint geometry row"))?,
+                ),
                 time: geometry.timestamps()[row],
             },
         })
@@ -514,73 +576,74 @@ impl JointBatch {
         offset: usize,
     ) -> Result<()> {
         let p = sens.columns()?;
-        let m = self.dimension();
-        let n = geometry.len();
-        for i in 0..n {
+        for (i, station) in geometry.iter_rows().enumerate() {
             let index = mapping.map_or(i, |indices| indices[i]);
-            if sens.timestamps.get(index) != Some(&geometry.timestamps()[i]) {
-                return Err(KernelError::InvalidInput(
-                    "sensitivity and geometry epochs do not match",
+            let sample = SensitivityRow {
+                time: sens.timestamps[index],
+                state: &sens.states[index],
+                stm: &sens.stm[index],
+                state_dcd: sens.state_dcd.get(index),
+            };
+            let (predicted, partial) = self.model.predict(sample.state, station, sample.time)?;
+            self.write_row(i, &predicted, &partial, &sample, output, offset, p)?;
+        }
+        Ok(())
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn write_row(
+        &self,
+        i: usize,
+        predicted: &Vector<f64, 5>,
+        partial: &Matrix<f64, 5, 6>,
+        sample: &SensitivityRow<'_>,
+        output: &mut Evaluation,
+        offset: usize,
+        p: usize,
+    ) -> Result<()> {
+        let m = self.dimension();
+        let n = self.values.len();
+        let lower = self.noise.row(i).factor.l();
+        let chained = partial * sample.stm;
+        let drag = sample
+            .state_dcd
+            .map_or_else(Vector::zeros, |drag| partial * drag);
+        let mut residual = Vector::<f64, 5>::zeros();
+        let mut jacobian = Matrix::<f64, 5, 7>::zeros();
+        for j in 0..m {
+            residual[j] = predicted[j] - self.values[i][j];
+            if self.model.azimuth_column() == Some(j) {
+                residual[j] = wrap_pi(residual[j]);
+            }
+            for k in 0..6 {
+                jacobian[(j, k)] = chained[(j, k)];
+            }
+            if p == 7 {
+                jacobian[(j, 6)] = drag[j];
+            }
+            // Forward solve Lr and LJ for this epoch's full covariance.
+            for earlier in 0..j {
+                let l = lower[(j, earlier)];
+                residual[j] -= l * residual[earlier];
+                for k in 0..p {
+                    jacobian[(j, k)] -= l * jacobian[(earlier, k)];
+                }
+            }
+            residual[j] /= lower[(j, j)];
+            let row = offset + j * n + i;
+            if !residual[j].is_finite() {
+                return Err(KernelError::Numerical(
+                    "whitened residual exceeds numeric range",
                 ));
             }
-            if !sens.stm[index].as_slice().iter().all(|v| v.is_finite())
-                || (p == 7
-                    && !sens.state_dcd[index]
-                        .as_slice()
-                        .iter()
-                        .all(|v| v.is_finite()))
-            {
-                return Err(KernelError::InvalidInput("sensitivities must be finite"));
-            }
-            let (predicted, partial) = self.model.predict(
-                &sens.states[index],
-                geometry.row(i).unwrap(),
-                geometry.timestamps()[i],
-            )?;
-            let chained = partial * sens.stm[index];
-            let drag = if p == 7 {
-                partial * sens.state_dcd[index]
-            } else {
-                Vector::zeros()
-            };
-            let mut residual = Vector::<f64, 5>::zeros();
-            let mut jacobian = Matrix::<f64, 5, 7>::zeros();
-            for j in 0..m {
-                residual[j] = predicted[j] - self.values[i][j];
-                if self.model.azimuth_column() == Some(j) {
-                    residual[j] = wrap_pi(residual[j]);
-                }
-                for k in 0..6 {
-                    jacobian[(j, k)] = chained[(j, k)];
-                }
-                if p == 7 {
-                    jacobian[(j, 6)] = drag[j];
-                }
-                // Forward solve Lr and LJ for this epoch's full covariance.
-                for earlier in 0..j {
-                    let l = self.lower[i][(j, earlier)];
-                    residual[j] -= l * residual[earlier];
-                    for k in 0..p {
-                        jacobian[(j, k)] -= l * jacobian[(earlier, k)];
-                    }
-                }
-                residual[j] /= self.lower[i][(j, j)];
-                let row = offset + j * n + i;
-                if !residual[j].is_finite() {
-                    return Err(KernelError::InvalidInput(
-                        "whitened residual exceeds numeric range",
+            output.residual[row] = residual[j];
+            for k in 0..p {
+                jacobian[(j, k)] /= lower[(j, j)];
+                if !jacobian[(j, k)].is_finite() {
+                    return Err(KernelError::Numerical(
+                        "whitened Jacobian exceeds numeric range",
                     ));
                 }
-                output.residual[row] = residual[j];
-                for k in 0..p {
-                    jacobian[(j, k)] /= self.lower[i][(j, j)];
-                    if !jacobian[(j, k)].is_finite() {
-                        return Err(KernelError::InvalidInput(
-                            "whitened Jacobian exceeds numeric range",
-                        ));
-                    }
-                    output.jacobian[(row, k)] = jacobian[(j, k)];
-                }
+                output.jacobian[(row, k)] = jacobian[(j, k)];
             }
         }
         Ok(())

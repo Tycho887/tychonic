@@ -9,7 +9,6 @@ use std::{
     fs::{self, File},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 use tychonic::{estimate::*, kernels::*, optim::*};
 use tychonic::{numeris, satkit};
@@ -236,21 +235,24 @@ fn main() -> AnyResult<()> {
     };
     let differential_sigma = differential_int.and(sigma);
     let nominal_differential_int = differential_int.unwrap_or(int);
-    let geometry = Arc::new(PreparedGeometry::new(&times, &vec![site; times.len()])?);
-    let mut priors = BTreeMap::<usize, RfPrior>::new();
+    let geometry = PreparedGeometry::new(&times, &vec![site; times.len()])?;
+    let mut priors = BTreeMap::<usize, (DynVector<f64>, DynVector<f64>)>::new();
     for r in rows(&input.join("priors.csv"))? {
         let trial = r[0].parse::<usize>()?;
         let k = r[2].parse::<usize>()?;
         if k >= 8 {
             return Err("source prior must contain eight RF parameters".into());
         }
-        let prior = priors.entry(trial).or_insert_with(|| RfPrior {
-            mean: DynVector::zeros(8),
-            sigma: DynVector::zeros(8),
-        });
-        prior.mean[k] = number(&r, 3)?;
-        prior.sigma[k] = number(&r, 4)?;
+        let prior = priors
+            .entry(trial)
+            .or_insert_with(|| (DynVector::zeros(8), DynVector::zeros(8)));
+        prior.0[k] = number(&r, 3)?;
+        prior.1[k] = number(&r, 4)?;
     }
+    let priors = priors
+        .into_iter()
+        .map(|(trial, (mean, sigma))| RfPrior::new(mean, sigma).map(|prior| (trial, prior)))
+        .collect::<tychonic::kernels::Result<BTreeMap<_, _>>>()?;
     let mut groups = BTreeMap::<(usize, i32), Vec<Vec<String>>>::new();
     for r in rows(&input.join("observations.csv"))? {
         let level = number(&r, 2)?;
@@ -387,22 +389,22 @@ fn main() -> AnyResult<()> {
                 "averaging_control",
                 "phase_doppler_differential",
             ] {
-                let data = PassiveRfData {
-                    geometry: geometry.clone(),
-                    interferometer: int,
-                    doppler_hz: if case == "averaging_control" {
+                let data = PassiveRfData::new(
+                    &geometry,
+                    int,
+                    if case == "averaging_control" {
                         averaging.clone()
                     } else {
                         f1.clone()
                     },
-                    phase_rad: Some(phases.clone()),
-                    sigma_doppler_hz: if case == "averaging_control" {
+                    Some(phases.clone()),
+                    if case == "averaging_control" {
                         sigma1 * sigma2 / (sigma1.powi(2) + sigma2.powi(2)).sqrt()
                     } else {
                         sigma1
                     },
-                    sigma_phase_rad: level.to_radians(),
-                };
+                    level.to_radians(),
+                )?;
                 let dd = (case == "phase_doppler_differential").then(|| DifferentialDopplerData {
                     difference_hz: differences.clone(),
                     sigma_antenna2_hz: sigma2,
@@ -414,11 +416,15 @@ fn main() -> AnyResult<()> {
                     differential_baseline_sigma_m: differential_sigma,
                 };
                 let problem = PassiveRfProblem::new_extended(
-                    cfg.clone(),
-                    data.clone(),
-                    prior.clone(),
+                    PropagationConfig::new(
+                        cfg.reference_epoch(),
+                        cfg.settings().clone(),
+                        cfg.mode(),
+                    )?,
+                    &data,
+                    prior,
                     ou,
-                    extensions.clone(),
+                    &extensions,
                 )?;
                 let batch = (|| -> AnyResult<()> {
                     let fit = fit_passive_rf(&problem, &problem.initial_parameters(), &settings)?;
@@ -432,8 +438,8 @@ fn main() -> AnyResult<()> {
                             p0[(i, j)] = fit.covariance[(i, j)];
                         }
                     }
-                    let p = sens.stm[0] * p0 * sens.stm[0].transpose();
-                    let x = sens.states[0];
+                    let p = sens.stm()[0] * p0 * sens.stm()[0].transpose();
+                    let x = sens.states()[0];
                     let (pe, ve, nees) = errors(&x, &p, truth.last().unwrap())?;
                     writeln!(
                         result,
@@ -463,11 +469,41 @@ fn main() -> AnyResult<()> {
                 }
                 let ekf = (|| -> AnyResult<()> {
                     let f = if sigma.is_some() && differential_sigma.is_some() {
-                        filter::<15>(cfg.clone(), ou, prior, &data, &extensions)?
+                        filter::<15>(
+                            PropagationConfig::new(
+                                cfg.reference_epoch(),
+                                cfg.settings().clone(),
+                                cfg.mode(),
+                            )?,
+                            ou,
+                            prior,
+                            &data,
+                            &extensions,
+                        )?
                     } else if sigma.is_some() || differential_sigma.is_some() {
-                        filter::<12>(cfg.clone(), ou, prior, &data, &extensions)?
+                        filter::<12>(
+                            PropagationConfig::new(
+                                cfg.reference_epoch(),
+                                cfg.settings().clone(),
+                                cfg.mode(),
+                            )?,
+                            ou,
+                            prior,
+                            &data,
+                            &extensions,
+                        )?
                     } else {
-                        filter::<9>(cfg.clone(), ou, prior, &data, &extensions)?
+                        filter::<9>(
+                            PropagationConfig::new(
+                                cfg.reference_epoch(),
+                                cfg.settings().clone(),
+                                cfg.mode(),
+                            )?,
+                            ou,
+                            prior,
+                            &data,
+                            &extensions,
+                        )?
                     };
                     let x = V6::from_slice(&f.x.as_slice()[..6]);
                     let mut p = M6::zeros();

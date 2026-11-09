@@ -1,5 +1,4 @@
 //! Fit and stream all four calibrated observables. Requires Satkit data.
-use std::sync::Arc;
 use tychonic::{
     OrbitFilter,
     estimate::{MeasurementModel, UpdateOptions},
@@ -9,6 +8,8 @@ use tychonic::{
     satkit::{Duration, Instant},
 };
 
+// Satkit settings copies are explicit at this external API boundary.
+#[allow(clippy::disallowed_methods)]
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let epoch = Instant::from_unixtime(1704110400.25);
     let times: Vec<_> = (0..13)
@@ -19,7 +20,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         lon_deg: -75.0,
         alt_m: 100.0,
     };
-    let geometry = Arc::new(PreparedGeometry::new(&times, &vec![station; times.len()])?);
+    let geometry = PreparedGeometry::new(&times, &vec![station; times.len()])?;
     let g = geometry.row(0).unwrap();
     let initial = v6_from(
         &(g.position() + g.rotation().to_gcrf(&v3(80e3, 40e3, 400e3))),
@@ -50,12 +51,9 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let truth = config.sample(&DynVector::from_slice(initial.as_slice()), &times)?;
     let values = (0..times.len())
         .map(|i| {
-            let sensor = m::joint_sensor::<5>(
-                geometry.row(i).unwrap().clone(),
-                times[i],
-                observables.clone(),
-            )?;
-            Ok(sensor.evaluate(&truth.states[i])?.0.as_slice().to_vec())
+            let sensor =
+                m::joint_sensor::<5>(geometry.row(i).unwrap(), times[i], observables.clone())?;
+            Ok(sensor.evaluate(&truth.states()[i])?.0.as_slice().to_vec())
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -79,9 +77,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         f_tol: 1e-5,
         ..LmSettings::default()
     };
+    let batches = vec![batch];
     let fit = m::fit_with_options(
-        config.clone(),
-        vec![batch.clone()],
+        PropagationConfig::new(
+            config.reference_epoch(),
+            config.settings().clone(),
+            config.mode(),
+        )?,
+        &batches,
         &DynVector::from_slice(guess.as_slice()),
         None,
         &settings,
@@ -97,7 +100,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     });
     let mut filter = OrbitFilter::new(config, guess, covariance)?;
     let updates = filter.filter_batches(
-        &[batch],
+        &batches,
         |_, _, _| Ok(M6::zeros()),
         UpdateOptions::default(),
     )?;

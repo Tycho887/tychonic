@@ -1,42 +1,85 @@
 //! Prior-inclusive RF batch fit with an analytically marginalized OU offset.
-use super::{FitError, LmOutcome, run_lm_with_drag};
+use super::{FitError, InputSource, LmOutcome, run_lm_with_drag};
 use crate::kernels::*;
-use numeris::{DynMatrix, DynVector, Matrix, optim::LmSettings};
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use numeris::{
+    DynMatrix, DynVector, Matrix,
+    dynmatrix::DynCholesky,
+    optim::{LmSettings, OptimError},
+};
 
 /// One prepared schedule. Doppler values are carrier-relative Hz; phases are
 /// unwrapped radians. None selects a Doppler-only baseline.
-#[derive(Clone, Debug)]
-pub struct PassiveRfData {
-    pub geometry: Arc<PreparedGeometry>,
-    pub interferometer: Interferometer,
-    pub doppler_hz: Vec<f64>,
-    pub phase_rad: Option<Vec<f64>>,
-    pub sigma_doppler_hz: f64,
-    pub sigma_phase_rad: f64,
+#[derive(Debug)]
+pub struct PassiveRfData<'g> {
+    pub(crate) geometry: GeometrySource<'g>,
+    pub(crate) interferometer: Interferometer,
+    pub(crate) doppler_hz: Vec<f64>,
+    pub(crate) phase_rad: Option<Vec<f64>>,
+    pub(crate) sigma_doppler_hz: f64,
+    pub(crate) sigma_phase_rad: f64,
 }
 
-impl PassiveRfData {
+impl<'g> PassiveRfData<'g> {
+    pub fn new(
+        geometry: impl Into<GeometrySource<'g>>,
+        interferometer: Interferometer,
+        doppler_hz: Vec<f64>,
+        phase_rad: Option<Vec<f64>>,
+        sigma_doppler_hz: f64,
+        sigma_phase_rad: f64,
+    ) -> Result<Self> {
+        let data = Self {
+            geometry: geometry.into(),
+            interferometer,
+            doppler_hz,
+            phase_rad,
+            sigma_doppler_hz,
+            sigma_phase_rad,
+        };
+        data.validate()?;
+        Ok(data)
+    }
+    pub fn geometry(&self) -> &PreparedGeometry {
+        &self.geometry
+    }
+    pub fn interferometer(&self) -> Interferometer {
+        self.interferometer
+    }
+    pub fn doppler_hz(&self) -> &[f64] {
+        &self.doppler_hz
+    }
+    pub fn phase_rad(&self) -> Option<&[f64]> {
+        self.phase_rad.as_deref()
+    }
+    pub fn sigma_doppler_hz(&self) -> f64 {
+        self.sigma_doppler_hz
+    }
+    pub fn sigma_phase_rad(&self) -> f64 {
+        self.sigma_phase_rad
+    }
+
     pub fn validate(&self) -> Result<()> {
         let n = self.geometry.len();
         if n == 0
             || self.doppler_hz.len() != n
-            || !self.doppler_hz.iter().all(|x| x.is_finite())
             || self
                 .phase_rad
                 .as_ref()
-                .is_some_and(|p| p.len() != n || !p.iter().all(|x| x.is_finite()))
-            || !self.sigma_doppler_hz.is_finite()
-            || self.sigma_doppler_hz <= 0.0
-            || !self.sigma_doppler_hz.powi(2).is_finite()
-            || self.sigma_doppler_hz.powi(2) == 0.0
-            || !self.sigma_phase_rad.is_finite()
-            || self.sigma_phase_rad <= 0.0
-            || !self.sigma_phase_rad.powi(2).is_finite()
-            || self.sigma_phase_rad.powi(2) == 0.0
+                .is_some_and(|phase| phase.len() != n)
         {
+            return Err(KernelError::InvalidInput("RF data dimensions"));
+        }
+        if !self.doppler_hz.iter().all(|x| x.is_finite())
+            || self
+                .phase_rad
+                .as_ref()
+                .is_some_and(|phase| !phase.iter().all(|x| x.is_finite()))
+        {
+            return Err(KernelError::InvalidInput("RF observations must be finite"));
+        }
+        if !valid_sigma(self.sigma_doppler_hz) || !valid_sigma(self.sigma_phase_rad) {
             return Err(KernelError::InvalidInput(
-                "RF data dimensions, values or sigmas",
+                "RF noise sigmas must be finite, positive and representable",
             ));
         }
         Ok(())
@@ -45,15 +88,28 @@ impl PassiveRfData {
 
 /// Diagonal Gaussian prior, ordered orbital parameters, frequency offset, phase
 /// mean. Optional drag remains orbital parameter 6. All units are physical.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RfPrior {
-    pub mean: DynVector<f64>,
-    pub sigma: DynVector<f64>,
+    pub(crate) mean: DynVector<f64>,
+    pub(crate) sigma: DynVector<f64>,
 }
 
 impl RfPrior {
+    pub fn new(mean: DynVector<f64>, sigma: DynVector<f64>) -> Result<Self> {
+        let prior = Self { mean, sigma };
+        prior.validate(prior.mean.len())?;
+        Ok(prior)
+    }
+    pub fn mean(&self) -> &DynVector<f64> {
+        &self.mean
+    }
+    pub fn sigma(&self) -> &DynVector<f64> {
+        &self.sigma
+    }
+
     pub fn validate(&self, columns: usize) -> Result<()> {
-        if self.mean.len() != columns
+        if columns == 0
+            || self.mean.len() != columns
             || self.sigma.len() != columns
             || !self.mean.as_slice().iter().all(|v| v.is_finite())
             || !self
@@ -70,7 +126,7 @@ impl RfPrior {
 
 /// f1-f2 formed from independent antenna frequency errors. Antenna 1's noise
 /// standard deviation comes from PassiveRfData::sigma_doppler_hz.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DifferentialDopplerData {
     pub difference_hz: Vec<f64>,
     pub sigma_antenna2_hz: f64,
@@ -98,7 +154,7 @@ impl DifferentialDopplerData {
         ])
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct RfExtensions {
     /// Independent 1σ ENU baseline errors, estimated as constant parameters.
     pub baseline_sigma_m: Option<V3>,
@@ -155,52 +211,52 @@ pub(crate) fn validate_rf_setup(
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-pub struct PassiveRfProblem {
+#[derive(Debug)]
+pub struct PassiveRfProblem<'g> {
     config: PropagationConfig,
-    data: PassiveRfData,
-    prior: RfPrior,
+    data: InputSource<'g, PassiveRfData<'g>>,
+    prior: InputSource<'g, RfPrior>,
     ou: OuPhaseNoise,
-    extensions: RfExtensions,
-    measurement_lower: DynMatrix<f64>,
+    extensions: InputSource<'g, RfExtensions>,
+    measurement_factor: DynCholesky<f64>,
 }
-impl PassiveRfProblem {
+impl<'g> PassiveRfProblem<'g> {
     pub fn new(
         config: PropagationConfig,
-        data: PassiveRfData,
-        prior: RfPrior,
+        data: impl Into<InputSource<'g, PassiveRfData<'g>>>,
+        prior: impl Into<InputSource<'g, RfPrior>>,
         ou: OuPhaseNoise,
     ) -> Result<Self> {
         Self::new_extended(config, data, prior, ou, RfExtensions::default())
     }
     pub fn new_extended(
         config: PropagationConfig,
-        data: PassiveRfData,
-        prior: RfPrior,
+        data: impl Into<InputSource<'g, PassiveRfData<'g>>>,
+        prior: impl Into<InputSource<'g, RfPrior>>,
         ou: OuPhaseNoise,
-        extensions: RfExtensions,
+        extensions: impl Into<InputSource<'g, RfExtensions>>,
     ) -> Result<Self> {
+        let data = data.into();
+        let prior = prior.into();
+        let extensions = extensions.into();
         validate_rf_setup(&config, &data, &prior, &extensions)?;
-        let mut problem = Self {
+        let measurement_factor = rf_covariance(&data, &extensions, ou)?
+            .cholesky()
+            .map_err(|_| KernelError::Singular)?;
+        let problem = Self {
             config,
             data,
             prior,
             ou,
             extensions,
-            measurement_lower: DynMatrix::zeros(0, 0),
+            measurement_factor,
         };
-        problem.measurement_lower = problem
-            .measurement_covariance()?
-            .cholesky()
-            .map_err(|_| KernelError::Singular)?
-            .l()
-            .clone();
         Ok(problem)
     }
     pub fn config(&self) -> &PropagationConfig {
         &self.config
     }
-    pub fn data(&self) -> &PassiveRfData {
+    pub fn data(&self) -> &PassiveRfData<'g> {
         &self.data
     }
     pub fn prior(&self) -> &RfPrior {
@@ -226,33 +282,7 @@ impl PassiveRfProblem {
         x
     }
     pub fn measurement_covariance(&self) -> Result<DynMatrix<f64>> {
-        let n = self.data.geometry.len();
-        let phase = self.data.phase_rad.is_some();
-        let differential = self.extensions.differential_doppler.as_ref();
-        let m = 1 + usize::from(phase) + usize::from(differential.is_some());
-        let mut c = DynMatrix::zeros(m * n, m * n);
-        for i in 0..n {
-            c[(i, i)] = self.data.sigma_doppler_hz.powi(2);
-        }
-        if phase {
-            let phase_c = self
-                .ou
-                .covariance(self.data.geometry.timestamps(), self.data.sigma_phase_rad)?;
-            for i in 0..n {
-                for j in 0..n {
-                    c[(n + i, n + j)] = phase_c[(i, j)];
-                }
-            }
-        }
-        if let Some(dd) = differential {
-            for i in 0..n {
-                c[(2 * n + i, 2 * n + i)] =
-                    self.data.sigma_doppler_hz.powi(2) + dd.sigma_antenna2_hz.powi(2);
-                c[(i, 2 * n + i)] = self.data.sigma_doppler_hz.powi(2);
-                c[(2 * n + i, i)] = self.data.sigma_doppler_hz.powi(2);
-            }
-        }
-        Ok(c)
+        rf_covariance(&self.data, &self.extensions, self.ou)
     }
     fn interferometer_at(&self, x: &DynVector<f64>) -> Result<Interferometer> {
         let p = self.config.mode().columns();
@@ -265,134 +295,165 @@ impl PassiveRfProblem {
         }
     }
     pub fn evaluate(&self, x: &DynVector<f64>) -> Result<Evaluation> {
+        let mut output = Evaluation::default();
+        self.evaluate_into(x, &mut output)?;
+        Ok(output)
+    }
+    pub fn evaluate_into(&self, x: &DynVector<f64>, e: &mut Evaluation) -> Result<()> {
+        self.check_parameters(x)?;
         let p = self.config.mode().columns();
-        let columns = self.columns();
-        if x.len() != columns || !x.as_slice().iter().all(|v| v.is_finite()) {
-            return Err(KernelError::InvalidInput("RF parameter dimensions/values"));
-        }
         let sens = self.config.sample(
             &DynVector::from_slice(&x.as_slice()[..p]),
             self.data.geometry.timestamps(),
         )?;
-        let n = self.data.geometry.len();
-        let phase = self.data.phase_rad.as_ref();
-        let differential = self.extensions.differential_doppler.as_ref();
-        let rows = n * (1 + usize::from(phase.is_some()) + usize::from(differential.is_some()));
+        let rows = self.measurement_factor.l().nrows();
+        let columns = self.columns();
+        e.resize(
+            rows.checked_add(columns)
+                .ok_or(KernelError::InvalidInput("RF output dimensions overflow"))?,
+            columns,
+        )?;
+        e.residual.as_mut_slice().fill(0.0);
+        e.jacobian.as_mut_slice().fill(0.0);
         let interferometer = self.interferometer_at(x)?;
-        let mut differential_int = self
-            .extensions
-            .differential_interferometer
-            .unwrap_or(interferometer);
+        let differential = self.differential_at(x, interferometer)?;
+        for ((i, geometry), sample) in self
+            .data
+            .geometry
+            .iter_rows()
+            .enumerate()
+            .zip(sens.iter_rows())
+        {
+            let pred = interferometer.evaluate(sample.state, geometry, x[p])?;
+            self.write_doppler(i, &sample, &pred, e);
+            self.write_phase(i, x, &sample, geometry, &pred, e);
+            self.write_differential(i, &sample, geometry, differential, e)?;
+        }
+        whiten(e, self.measurement_factor.l(), rows, columns);
+        self.write_priors(x, e, rows);
+        e.check_finite()
+    }
+    fn check_parameters(&self, x: &DynVector<f64>) -> Result<()> {
+        if x.len() != self.columns() || !x.as_slice().iter().all(|v| v.is_finite()) {
+            return Err(KernelError::InvalidInput("RF parameter dimensions/values"));
+        }
+        Ok(())
+    }
+    fn differential_at(&self, x: &DynVector<f64>, local: Interferometer) -> Result<Interferometer> {
+        let mut interferometer = self.extensions.differential_interferometer.unwrap_or(local);
         if self.extensions.differential_baseline_sigma_m.is_some() {
             let k = self.differential_baseline_column();
-            differential_int = differential_int.corrected(&v3(x[k], x[k + 1], x[k + 2]))?;
+            interferometer = interferometer.corrected(&v3(x[k], x[k + 1], x[k + 2]))?;
         }
-        let mut e = Evaluation::default();
-        e.resize(rows + columns, columns)?;
-        for i in 0..n {
-            let geometry = self.data.geometry.row(i).unwrap();
-            let pred = interferometer.evaluate(&sens.states[i], geometry, x[p])?;
-            let h = pred.partial * sens.stm[i];
-            for k in 0..6 {
-                e.jacobian[(i, k)] = h[(0, k)];
-                if phase.is_some() {
-                    e.jacobian[(n + i, k)] = h[(1, k)];
-                }
-            }
-            if p == 7 {
-                let h = pred.partial * sens.state_dcd[i];
-                e.jacobian[(i, 6)] = h[0];
-                if phase.is_some() {
-                    e.jacobian[(n + i, 6)] = h[1];
-                }
-            }
-            e.residual[i] = pred.doppler_hz - self.data.doppler_hz[i];
-            e.jacobian[(i, p)] = 1.0;
-            if let Some(observed) = phase {
-                e.residual[n + i] = pred.phase_rad + x[p + 1] - observed[i];
-                e.jacobian[(n + i, p)] = pred.phase_frequency_bias_partial;
-                e.jacobian[(n + i, p + 1)] = 1.0;
-                if self.extensions.baseline_sigma_m.is_some() {
-                    let h = pred.phase_baseline_partial_gcrf * geometry.rotation().matrix();
-                    for k in 0..3 {
-                        e.jacobian[(n + i, p + 2 + k)] = h[(0, k)];
-                    }
-                }
-            }
-            if let Some(dd) = differential {
-                let pred = differential_int.differential(
-                    &sens.states[i],
-                    geometry,
-                    self.data.geometry.timestamps()[i],
-                )?;
-                e.residual[2 * n + i] = pred.difference_hz - dd.difference_hz[i];
-                let h = pred.partial * sens.stm[i];
-                for k in 0..6 {
-                    e.jacobian[(2 * n + i, k)] = h[(0, k)];
-                }
-                if p == 7 {
-                    e.jacobian[(2 * n + i, 6)] = (pred.partial * sens.state_dcd[i])[0];
-                }
-                let baseline_column = if self.extensions.differential_baseline_sigma_m.is_some() {
-                    Some(self.differential_baseline_column())
-                } else if self.extensions.differential_interferometer.is_none()
-                    && self.extensions.baseline_sigma_m.is_some()
-                {
-                    Some(p + 2)
-                } else {
-                    None
-                };
-                if let Some(column) = baseline_column {
-                    for k in 0..3 {
-                        e.jacobian[(2 * n + i, column + k)] = pred.baseline_partial[(0, k)];
-                    }
-                }
+        Ok(interferometer)
+    }
+    fn write_doppler(
+        &self,
+        i: usize,
+        sample: &SensitivityRow<'_>,
+        pred: &RfPrediction,
+        e: &mut Evaluation,
+    ) {
+        let h = pred.partial * sample.stm;
+        for k in 0..6 {
+            e.jacobian[(i, k)] = h[(0, k)];
+        }
+        if let Some(drag) = sample.state_dcd {
+            e.jacobian[(i, 6)] = (pred.partial * drag)[0];
+        }
+        e.residual[i] = pred.doppler_hz - self.data.doppler_hz[i];
+        e.jacobian[(i, self.config.mode().columns())] = 1.0;
+    }
+    fn write_phase(
+        &self,
+        i: usize,
+        x: &DynVector<f64>,
+        sample: &SensitivityRow<'_>,
+        geometry: &StationGeometry,
+        pred: &RfPrediction,
+        e: &mut Evaluation,
+    ) {
+        let Some(observed) = &self.data.phase_rad else {
+            return;
+        };
+        let row = self.data.geometry.len() + i;
+        let p = self.config.mode().columns();
+        let h = pred.partial * sample.stm;
+        for k in 0..6 {
+            e.jacobian[(row, k)] = h[(1, k)];
+        }
+        if let Some(drag) = sample.state_dcd {
+            e.jacobian[(row, 6)] = (pred.partial * drag)[1];
+        }
+        e.residual[row] = pred.phase_rad + x[p + 1] - observed[i];
+        e.jacobian[(row, p)] = pred.phase_frequency_bias_partial;
+        e.jacobian[(row, p + 1)] = 1.0;
+        if self.extensions.baseline_sigma_m.is_some() {
+            let h = pred.phase_baseline_partial_gcrf * geometry.rotation().matrix();
+            for k in 0..3 {
+                e.jacobian[(row, p + 2 + k)] = h[(0, k)];
             }
         }
-        // Full whitening retains cross-covariance between ordinary and differential Doppler.
-        for i in 0..rows {
-            for j in 0..i {
-                let weight = self.measurement_lower[(i, j)];
-                if weight == 0.0 {
-                    continue;
-                }
-                e.residual[i] -= weight * e.residual[j];
-                for k in 0..columns {
-                    e.jacobian[(i, k)] -= weight * e.jacobian[(j, k)];
-                }
-            }
-            e.residual[i] /= self.measurement_lower[(i, i)];
-            for k in 0..columns {
-                e.jacobian[(i, k)] /= self.measurement_lower[(i, i)];
+    }
+    fn differential_baseline_column_for_model(&self) -> Option<usize> {
+        if self.extensions.differential_baseline_sigma_m.is_some() {
+            return Some(self.differential_baseline_column());
+        }
+        if self.extensions.differential_interferometer.is_none()
+            && self.extensions.baseline_sigma_m.is_some()
+        {
+            return Some(self.config.mode().columns() + 2);
+        }
+        None
+    }
+    fn write_differential(
+        &self,
+        i: usize,
+        sample: &SensitivityRow<'_>,
+        geometry: &StationGeometry,
+        interferometer: Interferometer,
+        e: &mut Evaluation,
+    ) -> Result<()> {
+        let Some(observed) = &self.extensions.differential_doppler else {
+            return Ok(());
+        };
+        let row = 2 * self.data.geometry.len() + i;
+        let pred = interferometer.differential(sample.state, geometry, sample.time)?;
+        let h = pred.partial * sample.stm;
+        for k in 0..6 {
+            e.jacobian[(row, k)] = h[(0, k)];
+        }
+        if let Some(drag) = sample.state_dcd {
+            e.jacobian[(row, 6)] = (pred.partial * drag)[0];
+        }
+        e.residual[row] = pred.difference_hz - observed.difference_hz[i];
+        if let Some(column) = self.differential_baseline_column_for_model() {
+            for k in 0..3 {
+                e.jacobian[(row, column + k)] = pred.baseline_partial[(0, k)];
             }
         }
+        Ok(())
+    }
+    fn write_priors(&self, x: &DynVector<f64>, e: &mut Evaluation, rows: usize) {
+        let p = self.config.mode().columns();
         for k in 0..p + 2 {
             e.residual[rows + k] = (x[k] - self.prior.mean[k]) / self.prior.sigma[k];
             e.jacobian[(rows + k, k)] = 1.0 / self.prior.sigma[k];
         }
-        if let Some(sigma) = &self.extensions.baseline_sigma_m {
-            for k in 0..3 {
-                e.residual[rows + p + 2 + k] = x[p + 2 + k] / sigma[k];
-                e.jacobian[(rows + p + 2 + k, p + 2 + k)] = 1.0 / sigma[k];
+        for (column, sigma) in [
+            (p + 2, self.extensions.baseline_sigma_m.as_ref()),
+            (
+                self.differential_baseline_column(),
+                self.extensions.differential_baseline_sigma_m.as_ref(),
+            ),
+        ] {
+            if let Some(sigma) = sigma {
+                for k in 0..3 {
+                    e.residual[rows + column + k] = x[column + k] / sigma[k];
+                    e.jacobian[(rows + column + k, column + k)] = 1.0 / sigma[k];
+                }
             }
         }
-        if let Some(sigma) = &self.extensions.differential_baseline_sigma_m {
-            let column = self.differential_baseline_column();
-            for k in 0..3 {
-                e.residual[rows + column + k] = x[column + k] / sigma[k];
-                e.jacobian[(rows + column + k, column + k)] = 1.0 / sigma[k];
-            }
-        }
-        if !e
-            .residual
-            .as_slice()
-            .iter()
-            .chain(e.jacobian.as_slice())
-            .all(|v| v.is_finite())
-        {
-            return Err(KernelError::InvalidInput("nonfinite RF evaluation"));
-        }
-        Ok(e)
     }
     /// Conditional OU drift mean given fitted orbital/offset/baseline parameters.
     pub fn conditional_drift(&self, x: &DynVector<f64>) -> Result<Vec<f64>> {
@@ -409,12 +470,8 @@ impl PassiveRfProblem {
             .sample(&DynVector::from_slice(&x.as_slice()[..p]), times)?;
         let interferometer = self.interferometer_at(x)?;
         let mut residual = DynVector::zeros(times.len());
-        for i in 0..times.len() {
-            let pred = interferometer.evaluate(
-                &sens.states[i],
-                self.data.geometry.row(i).unwrap(),
-                x[p],
-            )?;
+        for (i, geometry) in self.data.geometry.iter_rows().enumerate() {
+            let pred = interferometer.evaluate(&sens.states[i], geometry, x[p])?;
             residual[i] = observed[i] - pred.phase_rad - x[p + 1];
         }
         let c = self.ou.covariance(times, self.data.sigma_phase_rad)?;
@@ -471,74 +528,32 @@ pub fn fit_passive_rf(
     if let Some(sigma) = &problem.extensions.differential_baseline_sigma_m {
         scales.extend(sigma.as_slice());
     }
-    let cache: RefCell<Option<(Vec<f64>, Rc<Evaluation>)>> = RefCell::new(None);
-    let best: RefCell<Option<(DynVector<f64>, Rc<Evaluation>)>> = RefCell::new(None);
+    let mut best_parameters = DynVector::zeros(columns);
+    let mut best_rss = f64::INFINITY;
     let outcome = run_lm_with_drag(
         columns,
         guess,
         Some(&scales),
         settings,
         (p == 7).then_some(6),
-        |x| {
-            if let Some((key, e)) = &*cache.borrow()
-                && key == x.as_slice()
-            {
-                return Ok(e.clone());
+        |x, output| {
+            problem.evaluate_into(x, output)?;
+            let rss = output.rss();
+            if rss < best_rss {
+                best_parameters.as_mut_slice().copy_from_slice(x.as_slice());
+                best_rss = rss;
             }
-            let e = Rc::new(problem.evaluate(x)?);
-            if best
-                .borrow()
-                .as_ref()
-                .is_none_or(|(_, previous)| e.rss() < previous.rss())
-            {
-                *best.borrow_mut() = Some((x.clone(), e.clone()));
-            }
-            *cache.borrow_mut() = Some((x.as_slice().to_vec(), e.clone()));
-            Ok(e)
+            Ok(())
         },
     );
     let (outcome, linearized_tolerance) = match outcome {
         Ok(outcome) => (outcome, false),
-        Err(FitError::Solver(message)) if message == "MaxIterations" => {
-            let (parameters, evaluation) =
-                best.into_inner().expect("initial RF evaluation succeeded");
-            let mut j = evaluation.jacobian.clone();
-            for row in 0..j.nrows() {
-                for k in 0..columns {
-                    j[(row, k)] *= scales[k];
-                }
-            }
-            let negative = DynVector::from_slice(
-                &evaluation
-                    .residual
-                    .as_slice()
-                    .iter()
-                    .map(|v| -v)
-                    .collect::<Vec<_>>(),
-            );
-            let step = j.qr().map_err(|_| KernelError::Singular)?.solve(&negative);
-            let correction_norm = (0..columns)
-                .map(|k| ((parameters[k] - guess[k]) / scales[k]).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            let predicted_gain = 0.5
-                * (0..j.nrows())
-                    .map(|row| {
-                        (0..columns)
-                            .map(|k| j[(row, k)] * step[k])
-                            .sum::<f64>()
-                            .powi(2)
-                    })
-                    .sum::<f64>();
-            if !step.as_slice().iter().all(|v| v.is_finite())
-                || !(step.norm() <= settings.x_tol * (1.0 + correction_norm)
-                    || predicted_gain <= settings.f_tol * (1.0 + 0.5 * evaluation.rss()))
-            {
-                return Err(FitError::Solver(message));
-            }
+        Err(FitError::Solver(OptimError::MaxIterations)) => {
+            let evaluation = problem.evaluate(&best_parameters)?;
+            verify_linearized_tolerance(&evaluation, &best_parameters, guess, &scales, settings)?;
             (
                 LmOutcome {
-                    parameters,
+                    parameters: best_parameters,
                     evaluation,
                     iterations: settings.max_iter,
                 },
@@ -548,12 +563,8 @@ pub fn fit_passive_rf(
         Err(error) => return Err(error),
     };
     // Form information in scaled coordinates to protect mixed-unit pivots.
-    let mut j = outcome.evaluation.jacobian.clone();
-    for row in 0..j.nrows() {
-        for k in 0..columns {
-            j[(row, k)] *= scales[k];
-        }
-    }
+    let mut j = DynMatrix::zeros(outcome.evaluation.jacobian.nrows(), columns);
+    super::lm::scale_jacobian(&outcome.evaluation, &scales, &mut j);
     let mut covariance = (j.transpose() * j)
         .cholesky()
         .map_err(|_| KernelError::Singular)?
@@ -572,4 +583,103 @@ pub fn fit_passive_rf(
         iterations: outcome.iterations,
         linearized_tolerance,
     })
+}
+
+fn verify_linearized_tolerance(
+    evaluation: &Evaluation,
+    parameters: &DynVector<f64>,
+    guess: &DynVector<f64>,
+    scales: &[f64],
+    settings: &LmSettings<f64>,
+) -> std::result::Result<(), FitError> {
+    let mut j = DynMatrix::zeros(evaluation.jacobian.nrows(), scales.len());
+    super::lm::scale_jacobian(evaluation, scales, &mut j);
+    let negative = DynVector::from_slice(
+        &evaluation
+            .residual
+            .as_slice()
+            .iter()
+            .map(|v| -v)
+            .collect::<Vec<_>>(),
+    );
+    let step = j.qr().map_err(|_| KernelError::Singular)?.solve(&negative);
+    let correction_norm = (0..scales.len())
+        .map(|k| ((parameters[k] - guess[k]) / scales[k]).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let predicted_gain = 0.5
+        * (0..j.nrows())
+            .map(|row| {
+                (0..scales.len())
+                    .map(|k| j[(row, k)] * step[k])
+                    .sum::<f64>()
+                    .powi(2)
+            })
+            .sum::<f64>();
+    if !step.as_slice().iter().all(|v| v.is_finite())
+        || !correction_norm.is_finite()
+        || !predicted_gain.is_finite()
+        || !(step.norm() <= settings.x_tol * (1.0 + correction_norm)
+            || predicted_gain <= settings.f_tol * (1.0 + 0.5 * evaluation.rss()))
+    {
+        return Err(FitError::Solver(OptimError::MaxIterations));
+    }
+    Ok(())
+}
+
+fn rf_covariance(
+    data: &PassiveRfData,
+    extensions: &RfExtensions,
+    ou: OuPhaseNoise,
+) -> Result<DynMatrix<f64>> {
+    let n = data.geometry.len();
+    let phase = data.phase_rad.is_some();
+    let differential = extensions.differential_doppler.as_ref();
+    let m = 1 + usize::from(phase) + usize::from(differential.is_some());
+    let rows = m.checked_mul(n).ok_or(KernelError::InvalidInput(
+        "RF covariance dimensions overflow",
+    ))?;
+    rows.checked_mul(rows).ok_or(KernelError::InvalidInput(
+        "RF covariance dimensions overflow",
+    ))?;
+    let mut c = DynMatrix::zeros(rows, rows);
+    for i in 0..n {
+        c[(i, i)] = data.sigma_doppler_hz.powi(2);
+    }
+    if phase {
+        let phase_c = ou.covariance(data.geometry.timestamps(), data.sigma_phase_rad)?;
+        for i in 0..n {
+            for j in 0..n {
+                c[(n + i, n + j)] = phase_c[(i, j)];
+            }
+        }
+    }
+    if let Some(dd) = differential {
+        for i in 0..n {
+            c[(2 * n + i, 2 * n + i)] =
+                data.sigma_doppler_hz.powi(2) + dd.sigma_antenna2_hz.powi(2);
+            c[(i, 2 * n + i)] = data.sigma_doppler_hz.powi(2);
+            c[(2 * n + i, i)] = data.sigma_doppler_hz.powi(2);
+        }
+    }
+    Ok(c)
+}
+
+fn whiten(e: &mut Evaluation, lower: &DynMatrix<f64>, rows: usize, columns: usize) {
+    for i in 0..rows {
+        for j in 0..i {
+            let weight = lower[(i, j)];
+            if weight == 0.0 {
+                continue;
+            }
+            e.residual[i] -= weight * e.residual[j];
+            for k in 0..columns {
+                e.jacobian[(i, k)] -= weight * e.jacobian[(j, k)];
+            }
+        }
+        e.residual[i] /= lower[(i, i)];
+        for k in 0..columns {
+            e.jacobian[(i, k)] /= lower[(i, i)];
+        }
+    }
 }

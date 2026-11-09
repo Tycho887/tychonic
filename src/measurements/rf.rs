@@ -15,7 +15,7 @@ pub struct GaussianPrior {
 
 /// Named RF priors. Orbit entries are GCRF position/velocity, optionally drag.
 /// Frequency uses Hz and phase uses radians. No implicit offset or drift priors.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RfPriors {
     pub orbit_mean: DynVector<f64>,
     pub orbit_sigma: DynVector<f64>,
@@ -44,25 +44,25 @@ impl RfPriors {
 /// Setup for Doppler, Doppler/phase, or Doppler/phase/differential fitting.
 /// These are the existing augmented RF combinations; calibrated arbitrary
 /// combinations and angles use the ordinary measurement facade instead.
-#[derive(Clone, Debug)]
-pub struct RfBuilder {
+#[derive(Debug)]
+pub struct RfBuilder<'g> {
     config: PropagationConfig,
-    data: PassiveRfData,
+    data: InputSource<'g, PassiveRfData<'g>>,
     priors: RfPriors,
     drift: OuPhaseNoise,
     extensions: RfExtensions,
 }
 
-impl RfBuilder {
+impl<'g> RfBuilder<'g> {
     pub fn new(
         config: PropagationConfig,
-        data: PassiveRfData,
+        data: impl Into<InputSource<'g, PassiveRfData<'g>>>,
         priors: RfPriors,
         drift: OuPhaseNoise,
     ) -> Self {
         Self {
             config,
-            data,
+            data: data.into(),
             priors,
             drift,
             extensions: RfExtensions::default(),
@@ -88,16 +88,28 @@ impl RfBuilder {
         self.extensions.differential_baseline_sigma_m = Some(sigma_m);
         self
     }
-    pub fn build(self) -> Result<PassiveRfProblem> {
+    // External API boundary: Satkit requires an owned settings/TLE copy.
+    #[allow(clippy::disallowed_methods)]
+    pub fn build(&self) -> Result<PassiveRfProblem<'_>> {
         let prior = self.priors.prepare(self.config.mode().columns())?;
-        PassiveRfProblem::new_extended(self.config, self.data, prior, self.drift, self.extensions)
+        PassiveRfProblem::new_extended(
+            PropagationConfig::new(
+                self.config.reference_epoch(),
+                self.config.settings().clone(),
+                self.config.mode(),
+            )?,
+            &*self.data,
+            prior,
+            self.drift,
+            &self.extensions,
+        )
     }
     /// Fit starting from the supplied named prior means, with numeris defaults.
-    pub fn fit(self) -> std::result::Result<PassiveRfFit, FitError> {
+    pub fn fit(&self) -> std::result::Result<PassiveRfFit, FitError> {
         self.fit_with_options(&LmSettings::default())
     }
     pub fn fit_with_options(
-        self,
+        &self,
         settings: &LmSettings<f64>,
     ) -> std::result::Result<PassiveRfFit, FitError> {
         let problem = self.build()?;
@@ -106,6 +118,8 @@ impl RfBuilder {
     /// Construct the corresponding streaming estimator. N is 9/10 without
     /// calibration, plus three states per calibrated baseline. Data are validated
     /// with shared input checks, without allocating the dense batch covariance.
+    // External API boundary: Satkit requires an owned settings/TLE copy.
+    #[allow(clippy::disallowed_methods)]
     pub fn filter<const N: usize>(&self) -> EkfResult<PassiveRfEkf<N>> {
         let prior = self.priors.prepare(self.config.mode().columns())?;
         crate::optim::passive_rf::validate_rf_setup(
@@ -115,7 +129,11 @@ impl RfBuilder {
             &self.extensions,
         )?;
         PassiveRfEkf::new_with_calibration(
-            self.config.clone(),
+            PropagationConfig::new(
+                self.config.reference_epoch(),
+                self.config.settings().clone(),
+                self.config.mode(),
+            )?,
             self.drift,
             &prior,
             self.extensions.baseline_sigma_m,

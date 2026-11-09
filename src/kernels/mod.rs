@@ -33,6 +33,8 @@ pub enum KernelError {
     ZeroRange,
     UndefinedAzimuth,
     Singular,
+    /// A finite input led to unrepresentable numerical arithmetic.
+    Numerical(&'static str),
     Propagation(orbitprop::Error),
     Tle(String),
     Frame(frametransform::Error),
@@ -44,6 +46,7 @@ impl fmt::Display for KernelError {
             Self::InvalidInput(s) => write!(f, "invalid kernel input: {s}"),
             Self::ZeroRange => write!(f, "measurement is undefined at zero range"),
             Self::UndefinedAzimuth => write!(f, "azimuth/Jacobian is undefined at zenith or nadir"),
+            Self::Numerical(s) => write!(f, "numerical failure: {s}"),
             Self::Singular => write!(f, "information matrix is singular"),
             Self::Propagation(e) => write!(f, "propagation failed: {e}"),
             Self::Tle(e) => write!(f, "TLE propagation failed: {e}"),
@@ -123,7 +126,7 @@ pub fn chain_rule<const M: usize, const P: usize>(
     }
     let result = chain_rule_prevalidated(partial, sensitivity);
     if !finite(&result) {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "chained Jacobian exceeds numeric range",
         ));
     }

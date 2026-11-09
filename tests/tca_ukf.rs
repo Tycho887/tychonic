@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use numeris::{Matrix, Vector};
 use satkit::{
     Duration, Frame, ITRFCoord, Instant, TLE, frametransform,
@@ -264,7 +265,13 @@ fn weaker_pointing_noise_reduces_angular_influence() {
     let station = station_near(&truth, time, 2.5);
     let reading = measurement(&truth, time, station, 0.0);
     let mut strong = filter(prior, time);
-    let mut weak = strong.clone();
+    let mut weak = TcaUkf::new(
+        strong.prior_tle().clone(),
+        strong.epoch(),
+        *strong.state(),
+        *strong.covariance(),
+    )
+    .unwrap();
     let mut noise = tca_measurement_noise(1e6).unwrap();
     strong
         .observe(&reading, &noise, None, UpdateOptions::default())

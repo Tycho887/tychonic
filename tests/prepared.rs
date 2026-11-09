@@ -1,23 +1,25 @@
+#![allow(clippy::disallowed_methods)]
+#[path = "support/mod.rs"]
+mod copies;
+use copies::*;
+
 #[path = "../benches/support/mod.rs"]
 #[allow(dead_code)]
 mod support;
 
 use numeris::{DynVector, Matrix};
 use satkit::{Duration, Instant};
-use std::sync::Arc;
 use tychonic::{
     kernels::*,
     optim::{ODProblem, fit_lm},
 };
 
-fn batches(f: &support::Fixture) -> [PreparedBatch; 3] {
-    let geometry =
-        Arc::new(PreparedGeometry::from_trajectories(f.station.clone(), f.enu.clone()).unwrap());
+fn batches(f: &support::Fixture) -> [PreparedBatch<'_>; 3] {
+    let geometry = f.batch.geometry();
     let n = geometry.len();
     [
-        PreparedBatch::range_rate(geometry.clone(), vec![0.0; n], 0.05).unwrap(),
-        PreparedBatch::azimuth_elevation(geometry.clone(), vec![0.0; n], vec![0.0; n], 1e-4, 2e-4)
-            .unwrap(),
+        PreparedBatch::range_rate(geometry, vec![0.0; n], 0.05).unwrap(),
+        PreparedBatch::azimuth_elevation(geometry, vec![0.0; n], vec![0.0; n], 1e-4, 2e-4).unwrap(),
         PreparedBatch::combined(
             geometry,
             Observations {
@@ -61,12 +63,14 @@ fn each_prepared_model_has_correct_six_and_seven_column_derivatives() {
         assert!((a - b).abs() <= 1e-12 * (1.0 + a.abs()));
     }
     for columns in [6, 7] {
-        let mut sens = f.sensitivities.clone();
+        let mut sens = SampleInput::copy_from(&f.sensitivities);
         if columns == 6 {
             sens.state_dcd.clear();
         }
         for model in &models {
-            let original = model.evaluate_from_sensitivities(&sens).unwrap();
+            let original = model
+                .evaluate_from_sensitivities(&sens.prepare().unwrap())
+                .unwrap();
             assert_eq!(original.jacobian.ncols(), columns);
             for k in 0..columns {
                 let step = if k < 3 { 0.1 } else { 0.001 };
@@ -81,8 +85,12 @@ fn each_prepared_model_has_correct_six_and_seven_column_derivatives() {
                     plus.states[i] += direction * step;
                     minus.states[i] -= direction * step;
                 }
-                let p = model.evaluate_from_sensitivities(&plus).unwrap();
-                let m = model.evaluate_from_sensitivities(&minus).unwrap();
+                let p = model
+                    .evaluate_from_sensitivities(&plus.prepare().unwrap())
+                    .unwrap();
+                let m = model
+                    .evaluate_from_sensitivities(&minus.prepare().unwrap())
+                    .unwrap();
                 for row in 0..model.rows() {
                     let expected = (p.residual[row] - m.residual[row]) / (2.0 * step);
                     let actual = original.jacobian[(row, k)];
@@ -118,27 +126,34 @@ fn output_reuse_matches_owned_and_recovers_after_errors_and_shape_changes() {
         assert_eq!(output, owned);
         assert_eq!(rp, output.residual.as_slice().as_ptr());
         assert_eq!(jp, output.jacobian.as_slice().as_ptr());
-        let mut bad = f.sensitivities.clone();
+        let mut bad = SampleInput::copy_from(&f.sensitivities);
         bad.stm[8][(0, 0)] = f64::NAN;
+        assert!(bad.prepare().is_err());
+        bad = SampleInput::copy_from(&f.sensitivities);
+        bad.states[8][0] = f64::MAX;
         assert!(
             model
-                .evaluate_from_sensitivities_into(&bad, &mut output)
+                .evaluate_from_sensitivities_into(&bad.prepare().unwrap(), &mut output)
                 .is_err()
         );
         model
             .evaluate_from_sensitivities_into(&f.sensitivities, &mut output)
             .unwrap();
         assert_eq!(output, owned);
-        bad = f.sensitivities.clone();
+        bad = SampleInput::copy_from(&f.sensitivities);
         bad.timestamps[0] += Duration::from_seconds(0.000001);
-        assert!(model.evaluate_from_sensitivities(&bad).is_err());
-        bad = f.sensitivities.clone();
+        assert!(
+            model
+                .evaluate_from_sensitivities(&bad.prepare().unwrap())
+                .is_err()
+        );
+        bad = SampleInput::copy_from(&f.sensitivities);
         bad.state_dcd.pop();
-        assert!(model.evaluate_from_sensitivities(&bad).is_err());
-        let mut state_only = f.sensitivities.clone();
+        assert!(bad.prepare().is_err());
+        let mut state_only = SampleInput::copy_from(&f.sensitivities);
         state_only.state_dcd.clear();
         model
-            .evaluate_from_sensitivities_into(&state_only, &mut output)
+            .evaluate_from_sensitivities_into(&state_only.prepare().unwrap(), &mut output)
             .unwrap();
         assert_eq!(output.jacobian.ncols(), 6);
     }
@@ -152,19 +167,20 @@ fn range_rate_only_works_at_zenith_and_checked_rotation_imports_reject_bad_bases
         lon_deg: -75.0,
         alt_m: 100.0,
     };
-    let geometry = Arc::new(PreparedGeometry::new(&[t], &[site]).unwrap());
+    let geometry = PreparedGeometry::new(&[t], &[site]).unwrap();
     let g = geometry.row(0).unwrap();
     let up = g.rotation().to_gcrf(&v3(0.0, 0.0, 1.0));
-    let sens = Sensitivities {
-        timestamps: vec![t],
-        states: vec![v6_from(&(g.position() + up * 1e6), g.velocity())],
-        stm: vec![M6::eye()],
-        state_dcd: Vec::new(),
-    };
-    let rr = PreparedBatch::range_rate(geometry.clone(), vec![0.0], 1.0).unwrap();
+    let sens = Sensitivities::new(
+        vec![t],
+        vec![v6_from(&(g.position() + up * 1e6), g.velocity())],
+        vec![M6::eye()],
+        Vec::new(),
+    )
+    .unwrap();
+    let rr = PreparedBatch::range_rate(&geometry, vec![0.0], 1.0).unwrap();
     assert_eq!(rr.evaluate_from_sensitivities(&sens).unwrap().rss(), 0.0);
     let angles =
-        PreparedBatch::azimuth_elevation(geometry, vec![0.0], vec![0.0], 1.0, 1.0).unwrap();
+        PreparedBatch::azimuth_elevation(&geometry, vec![0.0], vec![0.0], 1.0, 1.0).unwrap();
     assert!(matches!(
         angles.evaluate_from_sensitivities(&sens),
         Err(KernelError::UndefinedAzimuth)
@@ -172,7 +188,7 @@ fn range_rate_only_works_at_zenith_and_checked_rotation_imports_reject_bad_bases
     for matrix in [M3::eye() * 2.0, M3::zeros(), M3::eye() * f64::NAN] {
         assert!(ValidatedRotation::new(matrix).is_err());
         assert!(
-            az_el_partial_with_rotation(&r_of(&sens.states[0]), &V3::zeros(), &matrix).is_err()
+            az_el_partial_with_rotation(&r_of(&sens.states()[0]), &V3::zeros(), &matrix).is_err()
         );
     }
     assert!(
@@ -223,23 +239,22 @@ fn geometry_interns_exact_station_epoch_pairs_and_preserves_order() {
     let lower = geometry.row(1).unwrap();
     let up = lower.rotation().to_gcrf(&v3(0.0, 0.0, 1.0));
     assert!((upper.position() - lower.position() - up * 2000.0).norm() < 1e-8);
-    let shared = Arc::new(geometry);
-    let rr = PreparedBatch::range_rate(shared.clone(), vec![0.0; 5], 1.0).unwrap();
+    let shared = geometry;
+    let rr = PreparedBatch::range_rate(&shared, vec![0.0; 5], 1.0).unwrap();
     let angles =
-        PreparedBatch::azimuth_elevation(shared.clone(), vec![0.0; 5], vec![0.0; 5], 1.0, 1.0)
-            .unwrap();
-    assert!(Arc::ptr_eq(rr.geometry(), angles.geometry()));
-    assert!(PreparedBatch::range_rate(shared.clone(), vec![0.0], 1.0).is_err());
+        PreparedBatch::azimuth_elevation(&shared, vec![0.0; 5], vec![0.0; 5], 1.0, 1.0).unwrap();
+    assert!(std::ptr::eq(rr.geometry(), angles.geometry()));
+    assert!(PreparedBatch::range_rate(&shared, vec![0.0], 1.0).is_err());
     for sigma in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        assert!(PreparedBatch::range_rate(shared.clone(), vec![0.0; 5], sigma).is_err());
+        assert!(PreparedBatch::range_rate(&shared, vec![0.0; 5], sigma).is_err());
     }
 }
 
 #[test]
 fn state_only_sampling_and_stacked_batches_share_exact_epochs() {
     let f = support::Fixture::new(1).unwrap();
-    let epoch = f.sensitivities.timestamps[0];
-    let state = leo_state(f.prepared_geometry.row(0).unwrap());
+    let epoch = f.sensitivities.timestamps()[0];
+    let state = leo_state(f.batch.geometry().row(0).unwrap());
     let x6 = DynVector::from_slice(state.as_slice());
     let mut parameters = state.as_slice().to_vec();
     parameters.push(0.02);
@@ -251,10 +266,11 @@ fn state_only_sampling_and_stacked_batches_share_exact_epochs() {
         epoch,
     ];
     let site = f.station.ground_stations[0];
-    let geometry = Arc::new(PreparedGeometry::new(&times, &[site; 4]).unwrap());
-    let rr = PreparedBatch::range_rate(geometry.clone(), vec![0.0; 4], 0.05).unwrap();
+    let geometry = PreparedGeometry::new(&times, &[site; 4]).unwrap();
+    let rr = PreparedBatch::range_rate(&geometry, vec![0.0; 4], 0.05).unwrap();
     let angles =
-        PreparedBatch::azimuth_elevation(geometry, vec![0.0; 4], vec![0.0; 4], 1e-4, 2e-4).unwrap();
+        PreparedBatch::azimuth_elevation(&geometry, vec![0.0; 4], vec![0.0; 4], 1e-4, 2e-4)
+            .unwrap();
     // State-only has no difference step to validate or drag perturbation arcs.
     let c6 = PropagationConfig::new(
         epoch,
@@ -270,23 +286,32 @@ fn state_only_sampling_and_stacked_batches_share_exact_epochs() {
     .unwrap();
     let s6 = c6.sample(&x6, &times).unwrap();
     let s7 = c7.sample(&x7, &times).unwrap();
-    assert!(s6.state_dcd.is_empty());
-    assert_eq!(s6.states, s7.states);
-    assert_eq!(s6.stm, s7.stm);
-    assert_eq!(s6.stm[1], M6::eye());
+    assert!(s6.state_dcd().is_empty());
+    assert_eq!(s6.states(), s7.states());
+    assert_eq!(s6.stm(), s7.stm());
+    assert_eq!(s6.stm()[1], M6::eye());
     assert!(s6.augmented_transition(1).is_err());
     for (config, x) in [(c6, x6), (c7, x7)] {
         let r = rr.evaluate(&x, &config).unwrap();
         let a = angles.evaluate(&x, &config).unwrap();
         // Add a third batch with a different schedule; order stays explicit.
         let short = PreparedBatch::range_rate(
-            Arc::new(PreparedGeometry::new(&[epoch], &[site]).unwrap()),
+            PreparedGeometry::new(&[epoch], &[site]).unwrap(),
             vec![0.0],
             0.05,
         )
         .unwrap();
         let single = short.evaluate(&x, &config).unwrap();
-        let problem = ODProblem::new(config, vec![angles.clone(), short, rr.clone()]).unwrap();
+        let problem = ODProblem::new(
+            config,
+            vec![
+                PreparedBatch::azimuth_elevation(&geometry, vec![0.0; 4], vec![0.0; 4], 1e-4, 2e-4)
+                    .unwrap(),
+                short,
+                PreparedBatch::range_rate(&geometry, vec![0.0; 4], 0.05).unwrap(),
+            ],
+        )
+        .unwrap();
         assert_eq!(problem.timestamps().len(), 3);
         let stacked = problem.evaluate(&x).unwrap();
         let expected: Vec<_> = a
@@ -309,27 +334,26 @@ fn state_only_sampling_and_stacked_batches_share_exact_epochs() {
             }
             offset += e.residual.len();
         }
-        let mut output = stacked.clone();
+        let mut output = copy_evaluation(&stacked);
         let ptr = output.jacobian.as_slice().as_ptr();
         problem.evaluate_into(&x, &mut output).unwrap();
         assert_eq!(output, stacked);
         assert_eq!(ptr, output.jacobian.as_slice().as_ptr());
-        assert!(fit_lm(problem, &x, Some(&[0.0]), &Default::default()).is_err());
+        assert!(fit_lm(&problem, &x, Some(&[0.0]), &Default::default()).is_err());
     }
 }
 
 #[test]
 fn thin_lm_adapter_recovers_six_state_parameters_from_stacked_models() {
     let f = support::Fixture::new(1).unwrap();
-    let epoch = f.sensitivities.timestamps[0];
-    let state = leo_state(f.prepared_geometry.row(0).unwrap());
+    let epoch = f.sensitivities.timestamps()[0];
+    let state = leo_state(f.batch.geometry().row(0).unwrap());
     let truth = DynVector::from_slice(state.as_slice());
     let times: Vec<_> = (0..13)
         .map(|i| epoch + Duration::from_seconds(-300.0 + 50.0 * i as f64))
         .collect();
-    let geometry = Arc::new(
-        PreparedGeometry::new(&times, &vec![f.station.ground_stations[0]; times.len()]).unwrap(),
-    );
+    let geometry =
+        PreparedGeometry::new(&times, &vec![f.station.ground_stations[0]; times.len()]).unwrap();
     let config = PropagationConfig::new(
         epoch,
         od_prop_settings(),
@@ -340,7 +364,7 @@ fn thin_lm_adapter_recovers_six_state_parameters_from_stacked_models() {
     let mut rr = Vec::new();
     let mut az = Vec::new();
     let mut el = Vec::new();
-    for (i, state) in sens.states.iter().enumerate() {
+    for (i, state) in sens.states().iter().enumerate() {
         let g = geometry.row(i).unwrap();
         rr.push(
             range_rate_partial(&r_of(state), &v_of(state), g.position(), g.velocity())
@@ -354,8 +378,8 @@ fn thin_lm_adapter_recovers_six_state_parameters_from_stacked_models() {
     let problem = ODProblem::new(
         config,
         vec![
-            PreparedBatch::range_rate(geometry.clone(), rr, 0.05).unwrap(),
-            PreparedBatch::azimuth_elevation(geometry, az, el, 1e-4, 2e-4).unwrap(),
+            PreparedBatch::range_rate(&geometry, rr, 0.05).unwrap(),
+            PreparedBatch::azimuth_elevation(&geometry, az, el, 1e-4, 2e-4).unwrap(),
         ],
     )
     .unwrap();
@@ -370,7 +394,7 @@ fn thin_lm_adapter_recovers_six_state_parameters_from_stacked_models() {
         f_tol: 1e-10,
         ..Default::default()
     };
-    let fit = fit_lm(problem.clone(), &guess, None, &settings).unwrap();
+    let fit = fit_lm(&problem, &guess, None, &settings).unwrap();
     assert!(fit.rss < 1e-6);
     assert!(
         (0..6)
@@ -381,7 +405,7 @@ fn thin_lm_adapter_recovers_six_state_parameters_from_stacked_models() {
     );
     guess[0] = f64::NAN;
     assert!(matches!(
-        fit_lm(problem, &guess, None, &settings),
+        fit_lm(&problem, &guess, None, &settings),
         Err(tychonic::optim::FitError::Kernel(_))
     ));
 }

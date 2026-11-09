@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.9.2
+
+- Replace reference counting and interior mutability in Tychonic-owned code
+  with owned or borrowed geometry, observation data and problems, plus reusable
+  mutable evaluation buffers. Kernels execute sequentially on the caller's thread.
+- Add a local fallible LM driver for ordinary, RF and variable-projection fits,
+  preserving damping and convergence equations while evaluating residuals and
+  Jacobians together and rejecting negative-drag trials before propagation.
+- Validate sensitivity arrays, RF data, priors, epochs and integration controls
+  before use. Return numerical and solver errors without panic extraction.
+- Store filter history with an always-present current record; restore small
+  checkpoints on failed observations and materialize RTS records explicitly.
+- Retain owned covariance factors and share one factor across independent joint
+  rows. Remove whole-estimator and whole-evaluation cloning.
+- Forbid unsafe library code and enforce ownership/error policies with Clippy,
+  a source check and CI. Pin and document the Numeris/Satkit trust boundary and
+  narrowly scoped external settings/TLE copies.
+- Intentionally break ownership, validated-input and history APIs; update
+  examples, tests and tools. See [migration](docs/migration_0_9_2.md),
+  [safety contracts](docs/safety.md) and [qualification](docs/qualification_0_9_2.md).
 
 - Add a two-state TCA UKF for TLE epoch correction and a constant pass
   range-rate bias, using combined range-rate and soft azimuth/elevation readings.

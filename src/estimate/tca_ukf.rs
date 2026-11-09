@@ -44,9 +44,14 @@ pub fn tca_measurement_noise(sigma_rr: f64) -> Result<MeasurementNoise> {
 /// Two-state unscented filter for combined range-rate and soft az/el readings.
 /// One filter represents one pass and one shared bias. State dynamics are
 /// constant, with optional caller-supplied discretized process covariance.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TcaUkf {
     prior: TLE,
+    estimate: TcaEstimate,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TcaEstimate {
     epoch: Instant,
     state: TcaState,
     covariance: TcaCovariance,
@@ -69,23 +74,25 @@ impl TcaUkf {
         check_finite(&initial_state_from_tle(&corrected, &epoch)?)?;
         Ok(Self {
             prior,
-            epoch,
-            state: initial,
-            covariance,
+            estimate: TcaEstimate {
+                epoch,
+                state: initial,
+                covariance,
+            },
         })
     }
 
     pub fn state(&self) -> &TcaState {
-        &self.state
+        &self.estimate.state
     }
 
     pub fn covariance(&self) -> &TcaCovariance {
-        &self.covariance
+        &self.estimate.covariance
     }
 
     /// Current observation epoch, not the corrected TLE epoch.
     pub fn epoch(&self) -> Instant {
-        self.epoch
+        self.estimate.epoch
     }
 
     pub fn prior_tle(&self) -> &TLE {
@@ -96,7 +103,7 @@ impl TcaUkf {
     /// Its other fields are preserved. The range-rate bias is a sensor parameter
     /// and does not enter the corrected TLE. Epochs round to satkit microseconds.
     pub fn corrected_tle(&self) -> Result<TLE> {
-        shifted_tle(&self.prior, self.state[0])
+        shifted_tle(&self.prior, self.estimate.state[0])
     }
 
     /// Constant-state prediction, adding optional discretized process covariance.
@@ -105,28 +112,7 @@ impl TcaUkf {
     /// Epochs must be chronological; same-epoch predictions require zero Q.
     /// Errors leave the filter unchanged.
     pub fn predict_to(&mut self, time: Instant, q: Option<&TcaCovariance>) -> Result<()> {
-        check_epoch(time)?;
-        if time < self.epoch {
-            return Err(KernelError::InvalidInput(
-                "TCA UKF epochs must be chronological",
-            ));
-        }
-        if let Some(q) = q {
-            check_covariance(q, false)?;
-        }
-        if time == self.epoch {
-            if q.is_some_and(|q| q.as_slice().iter().any(|v| *v != 0.0)) {
-                return Err(KernelError::InvalidInput(
-                    "same-epoch prediction requires zero process noise",
-                ));
-            }
-            return Ok(());
-        }
-        let covariance = self.covariance + q.copied().unwrap_or_else(Matrix::zeros);
-        check_covariance(&covariance, true)?;
-        self.covariance = covariance;
-        self.epoch = time;
-        Ok(())
+        predict_estimate(&mut self.estimate, time, q)
     }
 
     /// Predict and jointly update range-rate, azimuth, and elevation.
@@ -144,33 +130,37 @@ impl TcaUkf {
     ) -> Result<UpdateResult<3>> {
         let observed = measurement_values(measurement, options)?;
         let sigmas = measurement_sigmas(noise)?;
-        let mut candidate = self.clone();
-        candidate.predict_to(measurement.time, q)?;
+        let mut candidate = self.estimate;
+        predict_estimate(&mut candidate, measurement.time, q)?;
         let geometry = PreparedGeometry::new(&[measurement.time], &[measurement.station])?;
-        let result = candidate.update(
-            &observed,
-            geometry.row(0).expect("one prepared station"),
-            &sigmas,
-            options,
-        )?;
-        *self = candidate;
+        let station = geometry
+            .row(0)
+            .ok_or(KernelError::InvalidInput("TCA station geometry"))?;
+        let result = self.update(&mut candidate, &observed, station, &sigmas, options)?;
+        self.estimate = candidate;
         Ok(result)
     }
 
     fn update(
-        &mut self,
+        &self,
+        candidate: &mut TcaEstimate,
         observed: &V3,
         geometry: &StationGeometry,
         noise_sigmas: &V3,
         options: UpdateOptions,
     ) -> Result<UpdateResult<3>> {
-        let sigmas = sigma_points(&self.state, &self.covariance)?;
+        let sigmas = sigma_points(&candidate.state, &candidate.covariance)?;
         let mut predictions = [V3::zeros(); 5];
         for (prediction, sigma) in predictions.iter_mut().zip(&sigmas) {
-            *prediction = self.predict_measurement(sigma, geometry)?;
+            *prediction = self.predict_measurement(sigma, geometry, candidate.epoch)?;
         }
-        let transform =
-            measurement_transform(&self.state, &sigmas, &predictions, observed, noise_sigmas)?;
+        let transform = measurement_transform(
+            &candidate.state,
+            &sigmas,
+            &predictions,
+            observed,
+            noise_sigmas,
+        )?;
         let factor = transform
             .covariance
             .cholesky()
@@ -178,23 +168,21 @@ impl TcaUkf {
         let innovation = normalize(&transform.innovation, noise_sigmas);
         let nis = innovation.dot(&factor.solve(&innovation));
         if !nis.is_finite() || nis < 0.0 {
-            return Err(KernelError::InvalidInput(
-                "TCA UKF NIS exceeds numeric range",
-            ));
+            return Err(KernelError::Numerical("TCA UKF NIS exceeds numeric range"));
         }
         let accepted = options.gate.is_none_or(|gate| nis <= gate);
         if accepted {
             let gain = factor
                 .solve_matrix(&transform.cross.transpose())
                 .transpose();
-            let state = self.state + gain * innovation;
+            let state = candidate.state + gain * innovation;
             let covariance =
-                posterior_covariance(&self.state, &sigmas, &transform.deviations, &gain);
+                posterior_covariance(&candidate.state, &sigmas, &transform.deviations, &gain);
             check_finite(&state)?;
             shifted_tle(&self.prior, state[0])?;
             check_covariance(&covariance, true)?;
-            self.state = state;
-            self.covariance = covariance;
+            candidate.state = state;
+            candidate.covariance = covariance;
         }
         Ok(UpdateResult {
             innovation: transform.innovation,
@@ -203,9 +191,14 @@ impl TcaUkf {
         })
     }
 
-    fn predict_measurement(&self, state: &TcaState, geometry: &StationGeometry) -> Result<V3> {
+    fn predict_measurement(
+        &self,
+        state: &TcaState,
+        geometry: &StationGeometry,
+        epoch: Instant,
+    ) -> Result<V3> {
         let tle = shifted_tle(&self.prior, state[0])?;
-        let satellite = initial_state_from_tle(&tle, &self.epoch)?;
+        let satellite = initial_state_from_tle(&tle, &epoch)?;
         let r = r_of(&satellite);
         let (rr, _) = range_rate_partial(
             &r,
@@ -220,13 +213,16 @@ impl TcaUkf {
     }
 }
 
+// External API boundary: Satkit requires an owned settings/TLE copy.
+
+#[allow(clippy::disallowed_methods)]
 fn shifted_tle(prior: &TLE, seconds: f64) -> Result<TLE> {
     let microseconds = (seconds * 1e6).round();
     if !microseconds.is_finite()
         || microseconds <= i64::MIN as f64
         || microseconds >= i64::MAX as f64
     {
-        return Err(KernelError::InvalidInput(
+        return Err(KernelError::Numerical(
             "TCA epoch correction exceeds numeric range",
         ));
     }
@@ -235,7 +231,7 @@ fn shifted_tle(prior: &TLE, seconds: f64) -> Result<TLE> {
     tle.epoch = prior
         .epoch
         .checked_add(Duration::from_seconds(seconds))
-        .ok_or(KernelError::InvalidInput(
+        .ok_or(KernelError::Numerical(
             "corrected TLE epoch exceeds numeric range",
         ))?;
     check_epoch(tle.epoch)?;
@@ -416,6 +412,35 @@ fn posterior_covariance(
         covariance += residual * residual.transpose() * COVARIANCE_WEIGHTS[i];
     }
     (covariance + covariance.transpose()) * 0.5
+}
+
+fn predict_estimate(
+    estimate: &mut TcaEstimate,
+    time: Instant,
+    q: Option<&TcaCovariance>,
+) -> Result<()> {
+    check_epoch(time)?;
+    if time < estimate.epoch {
+        return Err(KernelError::InvalidInput(
+            "TCA UKF epochs must be chronological",
+        ));
+    }
+    if let Some(q) = q {
+        check_covariance(q, false)?;
+    }
+    if time == estimate.epoch {
+        if q.is_some_and(|q| q.as_slice().iter().any(|v| *v != 0.0)) {
+            return Err(KernelError::InvalidInput(
+                "same-epoch prediction requires zero process noise",
+            ));
+        }
+        return Ok(());
+    }
+    let covariance = estimate.covariance + q.copied().unwrap_or_else(Matrix::zeros);
+    check_covariance(&covariance, true)?;
+    estimate.covariance = covariance;
+    estimate.epoch = time;
+    Ok(())
 }
 
 #[cfg(test)]

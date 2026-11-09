@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods)]
 use satkit::{
     Duration, Instant,
     orbitprop::{Integrator, SatPropertiesSimple, TideModel},
@@ -10,6 +11,69 @@ fn epoch() -> Instant {
 
 fn leo() -> V6 {
     v6_from(&v3(6678e3, 0.0, 0.0), &v3(0.0, 7100.0, 3000.0))
+}
+
+#[test]
+fn epochs_and_integration_controls_are_checked_before_propagation() {
+    let t = epoch();
+    let x = leo();
+    let props = SatPropertiesSimple::new(0.0, 0.0);
+    let settings = od_prop_settings();
+    for (from, to) in [(Instant::INVALID, t), (t, Instant::INVALID)] {
+        assert!(matches!(
+            propagate_state(&x, &from, &to, &settings, &props),
+            Err(KernelError::InvalidInput(_))
+        ));
+        assert!(propagate_with_stm(&x, &from, &to, &settings, 0.0).is_err());
+    }
+    for times in [vec![], vec![Instant::INVALID]] {
+        assert!(compute_state_transitions(&x, &Instant::INVALID, &times, &settings, 0.0).is_err());
+        assert!(
+            compute_sensitivities(&x, &Instant::INVALID, &times, &settings, 0.0, 1e-4).is_err()
+        );
+    }
+    assert!(compute_state_transitions(&x, &t, &[Instant::INVALID], &settings, 0.0).is_err());
+    let tle = satkit::TLE::load_2line(
+        "1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9009",
+        "2 25544  51.6432 351.4697 0007417 130.5364 329.6482 15.48915330299350",
+    )
+    .unwrap();
+    assert!(initial_state_from_tle(&tle, &Instant::INVALID).is_err());
+
+    for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+        let mut s = od_prop_settings();
+        s.abs_error = invalid;
+        assert!(
+            PropagationConfig::new(t, s, ParameterMode::StateOnly { fixed_drag: 0.0 }).is_err()
+        );
+        let mut s = od_prop_settings();
+        s.rel_error = invalid;
+        assert!(propagate_state(&x, &t, &t, &s, &props).is_err());
+    }
+    for invalid in [f64::NAN, f64::INFINITY, 0.0] {
+        let mut s = od_prop_settings();
+        s.initial_step_secs = Some(invalid);
+        assert!(propagate_with_stm(&x, &t, &t, &s, 0.0).is_err());
+    }
+    let mut s = od_prop_settings();
+    s.abs_error = 0.0;
+    s.rel_error = 0.0;
+    assert!(propagate_state(&x, &t, &t, &s, &props).is_err());
+    s = od_prop_settings();
+    s.max_steps = 0;
+    assert!(compute_state_transitions(&x, &t, &[], &s, 0.0).is_err());
+
+    // Either tolerance may be zero, and a signed initial hint is a magnitude.
+    s = od_prop_settings();
+    s.rel_error = 0.0;
+    s.initial_step_secs = Some(-0.5);
+    let to = t + Duration::from_seconds(1.0);
+    let negative = propagate_state(&x, &t, &to, &s, &props).unwrap();
+    s.initial_step_secs = Some(0.5);
+    assert_eq!(negative, propagate_state(&x, &t, &to, &s, &props).unwrap());
+    s.abs_error = 0.0;
+    s.rel_error = 1e-13;
+    assert!(PropagationConfig::new(t, s, ParameterMode::StateOnly { fixed_drag: 0.0 }).is_ok());
 }
 
 fn close(actual: f64, expected: f64, atol: f64, rtol: f64, context: &str) {
@@ -140,9 +204,9 @@ fn zero_duration_is_exact_identity_even_for_nonzero_drag() {
     assert_eq!(phi, M6::eye());
     let sens = compute_sensitivities(&x, &t, &[t, t], &settings, 0.02, 1e-4).unwrap();
     for i in 0..2 {
-        assert_eq!(sens.states[i], x);
-        assert_eq!(sens.stm[i], M6::eye());
-        assert_eq!(sens.state_dcd[i], V6::zeros());
+        assert_eq!(sens.states()[i], x);
+        assert_eq!(sens.stm()[i], M6::eye());
+        assert_eq!(sens.state_dcd()[i], V6::zeros());
         assert_eq!(sens.augmented_transition(i).unwrap(), M7::eye());
     }
     assert!(sens.augmented_transition(2).is_err());
@@ -164,12 +228,12 @@ fn dense_arcs_preserve_unordered_and_duplicate_epochs() {
     let sens = compute_sensitivities(&x, &t, &times, &settings, 0.02, 1e-4).unwrap();
     for (i, end) in times.iter().enumerate() {
         let (state, phi) = propagate_with_stm(&x, &t, end, &settings, 0.02).unwrap();
-        assert!((r_of(&sens.states[i]) - r_of(&state)).norm() < 0.0001);
-        assert!((v_of(&sens.states[i]) - v_of(&state)).norm() < 1e-6);
+        assert!((r_of(&sens.states()[i]) - r_of(&state)).norm() < 0.0001);
+        assert!((v_of(&sens.states()[i]) - v_of(&state)).norm() < 1e-6);
         for row in 0..6 {
             for k in 0..6 {
                 close(
-                    sens.stm[i][(row, k)],
+                    sens.stm()[i][(row, k)],
                     phi[(row, k)],
                     1e-7,
                     1e-8,
@@ -178,9 +242,9 @@ fn dense_arcs_preserve_unordered_and_duplicate_epochs() {
             }
         }
     }
-    assert_eq!(sens.states[3], sens.states[5]);
-    assert_eq!(sens.stm[3], sens.stm[5]);
-    assert_eq!(sens.state_dcd[3], sens.state_dcd[5]);
+    assert_eq!(sens.states()[3], sens.states()[5]);
+    assert_eq!(sens.stm()[3], sens.stm()[5]);
+    assert_eq!(sens.state_dcd()[3], sens.state_dcd()[5]);
 }
 
 #[test]
@@ -231,21 +295,21 @@ fn drag_derivatives_match_independent_endpoint_differences_and_smaller_steps() {
                 ((plus - base) * 4.0 - (twice - base)) / (2.0 * step)
             };
             assert!(
-                r_of(&sens.state_dcd[i]).norm() > 1.0,
+                r_of(&sens.state_dcd()[i]).norm() > 1.0,
                 "drag column must be observable at this altitude"
             );
             for row in 0..6 {
                 let atol = if row < 3 { 0.005 } else { 1e-5 };
                 close(
-                    sens.state_dcd[i][row],
+                    sens.state_dcd()[i][row],
                     fd[row],
                     atol,
                     2e-4,
                     "endpoint drag difference",
                 );
                 close(
-                    sens.state_dcd[i][row],
-                    smaller.state_dcd[i][row],
+                    sens.state_dcd()[i][row],
+                    smaller.state_dcd()[i][row],
                     atol,
                     2e-4,
                     "drag step stability",
@@ -268,7 +332,7 @@ fn geo_has_zero_drag_sensitivity() {
         1e-4,
     )
     .unwrap();
-    assert_eq!(sens.state_dcd[0], V6::zeros());
+    assert_eq!(sens.state_dcd()[0], V6::zeros());
 }
 
 #[test]
@@ -280,7 +344,7 @@ fn forward_backward_roundtrip_and_augmented_transition_composition() {
     let settings = od_prop_settings();
     let first = compute_sensitivities(&x, &t, &[mid, end], &settings, 0.02, 1e-4).unwrap();
     let second =
-        compute_sensitivities(&first.states[0], &mid, &[end], &settings, 0.02, 1e-4).unwrap();
+        compute_sensitivities(&first.states()[0], &mid, &[end], &settings, 0.02, 1e-4).unwrap();
     let composed = second.augmented_transition(0).unwrap() * first.augmented_transition(0).unwrap();
     let direct = first.augmented_transition(1).unwrap();
     for row in 0..7 {
@@ -295,10 +359,10 @@ fn forward_backward_roundtrip_and_augmented_transition_composition() {
         }
     }
     let (returned, inverse) =
-        propagate_with_stm(&first.states[1], &end, &t, &settings, 0.02).unwrap();
+        propagate_with_stm(&first.states()[1], &end, &t, &settings, 0.02).unwrap();
     assert!((r_of(&returned) - r_of(&x)).norm() < 0.0001);
     assert!((v_of(&returned) - v_of(&x)).norm() < 1e-6);
-    let identity = inverse * first.stm[1];
+    let identity = inverse * first.stm()[1];
     for row in 0..6 {
         for k in 0..6 {
             close(
@@ -340,5 +404,5 @@ fn bad_parameters_and_unsupported_force_models_fail_cleanly() {
     assert!(propagate_with_stm(&x, &t, &t, &invalid, 0.02).is_err());
     assert!(compute_sensitivities(&V6::zeros(), &t, &[t], &settings, 0.02, 1e-4).is_err());
     let empty = compute_sensitivities(&x, &t, &[], &settings, 0.02, 1e-4).unwrap();
-    assert!(empty.states.is_empty());
+    assert!(empty.states().is_empty());
 }
