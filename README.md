@@ -5,7 +5,7 @@ Passive orbit determination in Rust using **satkit** for astrodynamics and
 observables and analytic state derivatives, fits batches, and updates an orbit
 as new measurements arrive.
 
-Version **0.9.4** accepts extracted Doppler, phase difference, differential
+Version **0.9.5** accepts extracted Doppler, phase difference, differential
 Doppler, and azimuth/elevation. Each calibrated observable works independently,
 and any combination can be fused with full covariance. Fitting requires an
 initial orbit guess; initialization without one is future work. IQ processing,
@@ -17,7 +17,7 @@ Add tychonic from [crates.io](https://crates.io/crates/tychonic):
 
 ```toml
 [dependencies]
-tychonic = "0.9.4"
+tychonic = "0.9.5"
 ```
 
 See the [API documentation](https://docs.rs/tychonic) for available types and

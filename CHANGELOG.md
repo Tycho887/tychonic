@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.5
+
+- Add reusable caller-clocked behavioral mount and receiver simulation kernels.
+- Add Gaussian beam loss, hard reception cutoff, acquisition dwell, lock
+  hysteresis, seeded Doppler noise, and absent unlocked observations.
+- Add actual-epoch orbital frequency/pointing samples and cache-safe TLE epoch
+  hypotheses. Keep transport and spacecraft-truth disclosure caller-owned.
+- Verify cutoff boundaries, actuator limits, seeded replay, invalid inputs,
+  frequency against independent range differences, and retained numerical APIs.
+
 ## 0.9.4
 
 - Add covariance-enabled calibrated batch LM and facade APIs without changing
