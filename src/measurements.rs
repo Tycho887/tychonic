@@ -7,7 +7,10 @@
 
 use crate::estimate::{MeasurementModel, Observation, OrbitEkf};
 use crate::kernels::*;
-use crate::optim::{FitError, FitResult, ODProblem, fit_lm};
+use crate::optim::{
+    CovarianceFit, CovarianceFitError, FitError, FitResult, ODProblem, fit_lm,
+    fit_lm_with_covariance,
+};
 use numeris::{DynMatrix, DynVector, Matrix, Vector, dynmatrix::DynCholesky, optim::LmSettings};
 use satkit::Instant;
 use std::ops::Deref;
@@ -502,6 +505,22 @@ pub fn fit_with_options<'g>(
     settings: &LmSettings<f64>,
 ) -> std::result::Result<FitResult, FitError> {
     fit_lm(&ODProblem::new(config, batches)?, guess, scales, settings)
+}
+
+/// Fit calibrated prepared batches with absolute physical parameter covariance.
+///
+/// Inputs and LM settings match [`fit_with_options`]. Measurement covariances
+/// define absolute uncertainties. A converged rank-deficient solution returns
+/// an error; covariance is never regularized or scaled by residual variance.
+/// See [`crate::optim::parameter_covariance`] for numerical rank semantics.
+pub fn fit_with_covariance<'g>(
+    config: PropagationConfig,
+    batches: impl Into<crate::optim::BatchSource<'g>>,
+    guess: &DynVector<f64>,
+    scales: Option<&[f64]>,
+    settings: &LmSettings<f64>,
+) -> std::result::Result<CovarianceFit, CovarianceFitError> {
+    fit_lm_with_covariance(&ODProblem::new(config, batches)?, guess, scales, settings)
 }
 
 #[derive(Debug)]

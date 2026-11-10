@@ -29,4 +29,6 @@ pub mod estimate;
 pub mod kernels;
 pub mod measurements;
 pub mod optim;
-pub use measurements::{OrbitFilter, OrbitFilterWithDrag, fit, fit_with_options};
+pub use measurements::{
+    OrbitFilter, OrbitFilterWithDrag, fit, fit_with_covariance, fit_with_options,
+};

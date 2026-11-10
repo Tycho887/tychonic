@@ -1,8 +1,22 @@
 # Changelog
 
-## 0.9.3 — Unreleased
+## 0.9.4
 
-Intended release contents include all additions since 0.9.2. See the
+- Add covariance-enabled calibrated batch LM and facade APIs without changing
+  existing fit functions or `FitError` variants. Return physical parameter
+  covariance, numerical rank, and its statistical interpretation.
+- Compute absolute whitened-information covariance from the final retained LM
+  evaluation using column-normalized pivoted QR and compact R SVD. Exclude
+  residual scaling and solver damping; retain Varpro Schur covariance behavior.
+- Return structured rank and numerical errors instead of regularization or
+  pseudo-priors. Keep covariance storage linear in observation count.
+- Verify analytic correlated-noise references, units and optimizer-scale
+  invariance, six/seven-parameter fits, singular geometry, arithmetic overflow,
+  and noisy mixed-observable recovery. Add a reproducible downstream fixture.
+
+## 0.9.3
+
+Release contents include all additions since 0.9.2. See the
 [feature outline](docs/release_0_9_3.md) for interfaces, integration, and validation.
 
 - Add the public `detection` module and `BcMpc` controller for Bayesian

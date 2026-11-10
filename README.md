@@ -5,7 +5,7 @@ Passive orbit determination in Rust using **satkit** for astrodynamics and
 observables and analytic state derivatives, fits batches, and updates an orbit
 as new measurements arrive.
 
-Version **0.9.2** accepts extracted Doppler, phase difference, differential
+Version **0.9.4** accepts extracted Doppler, phase difference, differential
 Doppler, and azimuth/elevation. Each calibrated observable works independently,
 and any combination can be fused with full covariance. Fitting requires an
 initial orbit guess; initialization without one is future work. IQ processing,
@@ -17,24 +17,22 @@ Add tychonic from [crates.io](https://crates.io/crates/tychonic):
 
 ```toml
 [dependencies]
-tychonic = "0.9.2"
+tychonic = "0.9.4"
 ```
 
 See the [API documentation](https://docs.rs/tychonic) for available types and
 functions. `tychonic::satkit` and `tychonic::numeris` re-export the dependency
 versions accepted by the API.
 
-## Intended features for 0.9.3
+## Features added in 0.9.3
 
-The next release adds BC-MPC satellite acquisition, weighted TLE/OMM beliefs,
+Version 0.9.3 added BC-MPC satellite acquisition, weighted TLE/OMM beliefs,
 antenna-constrained search planning, Bayesian miss updates and resampling,
 shared checked batch SGP4 propagation, and a reproducible simulated discovery
 example. The [0.9.3 feature outline](docs/release_0_9_3.md) lists all additions
-since 0.9.2 and their validation. These features are available in this source
-tree; the package manifest and installation instructions still target 0.9.2
-until release preparation.
+since 0.9.2 and their validation. These features are available in the published crate.
 
-## Acquire with BC-MPC (unreleased 0.9.3)
+## Acquire with BC-MPC
 
 `tychonic::detection` provides Bayesian Continuation MPC acquisition kernels
 and `BcMpc` state. Supply a nominal TLE or OMM, explicit particles and weights,
@@ -229,3 +227,16 @@ ignored `references/`. Selected documentation figures belong in `docs/assets/`.
 See [references](references/README.md) and [release packaging](docs/publishing.md).
 
 Licensed under **MIT OR Apache-2.0**.
+
+## Absolute calibrated batch covariance
+
+Version 0.9.4 adds `measurements::fit_with_covariance` and
+`optim::fit_lm_with_covariance`. They retain the existing LM inputs and return
+`CovarianceFit`, including physical parameter covariance, numerical rank, and
+`CovarianceMethod::AbsoluteWhitenedInformation`. Measurement covariances define
+absolute uncertainty; covariance excludes residual scaling and solver damping.
+
+Rank-deficient fits return `CovarianceFitError::Covariance` rather than a
+regularized matrix. Existing fit functions and contact-bias variable-projection
+covariance retain their behavior. See the [covariance guide](docs/covariance.md)
+for units, rank tolerance, memory bounds, and examples.

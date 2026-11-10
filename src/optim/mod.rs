@@ -14,6 +14,11 @@ use numeris::{
 };
 mod input;
 pub use input::InputSource;
+mod covariance;
+pub use covariance::{
+    CovarianceError, CovarianceFitError, CovarianceMethod, ParameterCovariance,
+    parameter_covariance,
+};
 mod lm;
 use lm::{run_lm, run_lm_with_drag};
 use satkit::{Instant, orbitprop::PropSettings};
@@ -243,5 +248,49 @@ pub fn fit_lm(
         parameters: outcome.parameters,
         iterations: outcome.iterations,
         rss: outcome.evaluation.rss(),
+    })
+}
+
+/// Converged parameters with identifiable absolute measurement uncertainty.
+#[derive(Debug)]
+pub struct CovarianceFit {
+    /// Fitted parameters in physical state and optional drag units.
+    pub parameters: DynVector<f64>,
+    /// Number of LM iterations before convergence.
+    pub iterations: usize,
+    /// Sum of squares of the final calibrated, whitened residuals.
+    pub rss: f64,
+    /// Physical parameter covariance, without RSS scaling or LM damping.
+    pub covariance: numeris::DynMatrix<f64>,
+    /// Numerical rank of the final whitened information.
+    pub rank: usize,
+    /// Statistical interpretation of the covariance matrix.
+    pub covariance_method: CovarianceMethod,
+}
+
+/// Fit a prepared problem and obtain absolute physical parameter covariance.
+///
+/// Uses the same solver and defaults as [`fit_lm`]. Covariance is calculated from
+/// its retained converged evaluation; no extra propagation pass is required.
+/// See [`parameter_covariance`] for rank tolerance, units, and failure policy.
+/// A converged but unobservable fit returns [`CovarianceFitError::Covariance`].
+pub fn fit_lm_with_covariance(
+    problem: &ODProblem<'_>,
+    guess: &DynVector<f64>,
+    scales: Option<&[f64]>,
+    settings: &LmSettings<f64>,
+) -> std::result::Result<CovarianceFit, CovarianceFitError> {
+    let columns = problem.config.mode().columns();
+    let outcome = run_lm(columns, guess, scales, settings, |x, output| {
+        problem.evaluate_into(x, output)
+    })?;
+    let uncertainty = parameter_covariance(&outcome.evaluation.jacobian)?;
+    Ok(CovarianceFit {
+        parameters: outcome.parameters,
+        iterations: outcome.iterations,
+        rss: outcome.evaluation.rss(),
+        covariance: uncertainty.matrix,
+        rank: uncertainty.rank,
+        covariance_method: uncertainty.method,
     })
 }
