@@ -1,5 +1,9 @@
 # BC-MPC acquisition
 
+This API and the simulated discovery example are intended for **0.9.3** and are
+available in the current source tree. See the [release feature outline](release_0_9_3.md)
+for all additions since 0.9.2.
+
 The `detection` module implements the acquisition math in *Optimal Search for
 Finding Satellites Post-Launch*, particularly the Bayesian miss update in Eq. (3)
 and the full-contact continuation objective in Eqs. (9–10). The Python prototype
@@ -118,8 +122,39 @@ The resampling callback supplies a finite uniform value in `[0, 1)` and is calle
 only when resampling is needed. The caller can use an independently seeded RNG
 for planning/resampling and for physical or simulated receiver outcomes.
 
+## Run a simulated discovery
+
+The [acquisition example](../examples/acquisition.rs) and integration tests share
+a small simulated plant with an independent true orbit, ideal antenna motion,
+and the Python prototype's Gaussian receiver. The ISS fixture's planning orbit
+is shifted 10 seconds along track; seven equally weighted particles span ±30
+seconds around it. The plant propagates truth at each listening midpoint,
+samples receiver feedback, and advances its clock to listen end without waiting.
+It checks cycle order, listening times, elevation mask, and slew feasibility
+before executing a command. Failed execution leaves the action pending.
+
+With Satkit data already provisioned, run:
+
+```sh
+SATKIT_OFFLINE=1 cargo run --locked --example acquisition
+SATKIT_OFFLINE=1 cargo test --locked --test acquisition
+```
+
+Receiver seed 42 and independent resampling seed 43 use SplitMix64 for
+reproducible feedback. The example prints per-cycle pointing error, receiver
+probability and draw, slew duration, predicted remaining acquisition probability,
+resampling, and outcome. The default run starts about 5.26° off target and
+acquires after two cycles (12 simulated seconds). It returns an error if the
+budget is exhausted. Geometry requires the same cached Satkit data as other
+acquisition tests; the example does not download it.
+
+The regression verifies repeated runs produce identical traces and acquisition
+stops immediately after confirmation. A zero-probability receiver verifies
+32 misses exhaust the 192-second budget. Rejected commands and receiver failures
+are also checked to preserve the pending action and receiver random sequence.
+
 Contact selection, prior sampling, multi-contact scheduling, numerical orbit
 hypotheses, mount axis limits, actuator imperfections, and lock maintenance are
 outside this controller. Existing Satkit data provisioning/offline behavior is
-unchanged. The reference test verifies a deterministic loop and kernel contracts;
-it does not reproduce the paper's fleet statistics or promise acquisition.
+unchanged. The seeded example verifies discovery for this fixture; it does not
+reproduce the paper's fleet statistics or promise acquisition for other inputs.

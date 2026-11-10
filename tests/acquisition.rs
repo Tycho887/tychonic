@@ -1,4 +1,8 @@
 #![allow(clippy::disallowed_methods)]
+#[path = "../examples/support/acquisition.rs"]
+mod simulation;
+
+use simulation::{BEAM_FWHM_RAD, GaussianReceiver, SimulationResult, run_simulation};
 use tychonic::{
     detection::*,
     kernels::{self, PreparedGeometry, V3, v3},
@@ -19,11 +23,7 @@ fn direction(az_deg: f64, el_deg: f64) -> EnuDirection {
     EnuDirection::from_az_el(az_deg.to_radians(), el_deg.to_radians()).unwrap()
 }
 fn tle() -> TLE {
-    TLE::load_2line(
-        "1 25544U 98067A   24356.58519896  .00014389  00000-0  25222-3 0  9992",
-        "2 25544  51.6403 106.8969 0007877   6.1421 113.2479 15.50801739487617",
-    )
-    .unwrap()
+    simulation::tle().unwrap()
 }
 fn belief(weights: Vec<f64>) -> ParticleBelief {
     ParticleBelief::new((0..weights.len()).map(|_| tle().into()).collect(), weights).unwrap()
@@ -493,20 +493,7 @@ fn optimizer_can_hold_outside_candidates_and_rejects_below_mask_commands() {
 }
 
 fn station_and_start() -> (GroundStation, Instant) {
-    let mut orbit = tle();
-    let center = orbit.epoch + Duration::from_seconds(600.0);
-    let propagated = sgp4(&mut orbit, &[center]).unwrap();
-    let r = V3::from_slice(propagated.pos.col_slice(0));
-    let local = frametransform::qteme2itrf(&center) * r;
-    let (lat, lon, _) = ITRFCoord::from_vector(&local).to_geodetic_rad();
-    (
-        GroundStation {
-            lat_deg: lat.to_degrees() + 2.5,
-            lon_deg: lon.to_degrees(),
-            alt_m: 0.0,
-        },
-        center - Duration::from_seconds(96.0),
-    )
+    simulation::station_and_start().unwrap()
 }
 
 #[test]
@@ -853,30 +840,6 @@ fn private_bootstrap_makes_partial_slews_when_candidates_are_unreachable() {
     }
 }
 
-// Reference receiver: the paper specifies Gaussian beam shape but leaves its
-// on-axis link function open. This matches the Python prototype explicitly.
-struct GaussianReceiver;
-impl DetectionModel for GaussianReceiver {
-    fn probabilities(
-        &mut self,
-        command: EnuDirection,
-        particles: &[PointingGeometry],
-        listen_s: f64,
-        output: &mut [f64],
-    ) -> Result<()> {
-        for (point, probability) in particles.iter().zip(output) {
-            let error = command.separation(point.direction_enu);
-            let beam = (-4.0 * 2_f64.ln() * (error / 2_f64.to_radians()).powi(2)).exp();
-            let p_second = if point.visible {
-                0.8 * (1e6 / point.range_m).powi(2).min(1.0) * point.elevation_rad.sin() * beam
-            } else {
-                0.0
-            };
-            *probability = -((1.0 - p_second).ln() * listen_s).exp_m1();
-        }
-        Ok(())
-    }
-}
 struct ReferencePlant {
     truth: TLE,
     station: GroundStation,
@@ -970,4 +933,136 @@ fn reference_caller_loop_with_private_bootstrap_and_separate_hidden_truth() {
             .iter()
             .all(|p| p.is_finite() && (0.0..=1.0).contains(p))
     );
+}
+
+fn assert_simulation_contract(result: &SimulationResult) {
+    let setup = result.setup;
+    let config = setup.config;
+    assert_eq!(result.controller_cycles, result.plant_cycles);
+    assert_eq!(result.records.len(), result.plant_cycles);
+    assert!(result.plant_cycles <= config.cycle_count().unwrap());
+    let mut previous = result.initial_direction;
+    for (cycle, step) in result.records.iter().enumerate() {
+        assert_eq!(step.cycle, cycle);
+        let expected_start = setup.start
+            + Duration::from_seconds(
+                cycle as f64 * config.cycle_duration_s() + config.move_s + config.settle_s,
+            );
+        assert_eq!(step.listen_start, expected_start);
+        assert_eq!(
+            step.listen_end,
+            expected_start + Duration::from_seconds(config.listen_s)
+        );
+        close(
+            step.elapsed_s,
+            (cycle + 1) as f64 * config.cycle_duration_s(),
+            1e-6,
+        );
+        assert!(step.elapsed_s <= config.search_duration_s);
+        assert!(step.direction_enu.elevation_rad() >= setup.elevation_mask_rad);
+        assert!(step.slew_time_s <= config.move_s + 1e-8);
+        close(
+            step.slew_time_s,
+            setup
+                .antenna
+                .slew_time_s(previous, step.direction_enu)
+                .unwrap(),
+            1e-12,
+        );
+        for probability in [
+            step.detection_probability,
+            step.predicted_acquisition_probability,
+            step.retained_acquisition_probability,
+        ] {
+            assert!(probability.is_finite() && (0.0..=1.0).contains(&probability));
+        }
+        assert!(step.predicted_acquisition_probability >= step.retained_acquisition_probability);
+        assert!((0.0..1.0).contains(&step.receiver_draw));
+        assert_eq!(
+            step.observation == Observation::Acquired,
+            step.receiver_draw < step.detection_probability
+        );
+        previous = step.direction_enu;
+    }
+    assert_eq!(result.plant_time, result.records.last().unwrap().listen_end);
+}
+
+#[test]
+fn seeded_simulated_satellite_is_discovered_with_reproducible_feedback() {
+    let first = run_simulation(GaussianReceiver).unwrap();
+    let repeat = run_simulation(GaussianReceiver).unwrap();
+    assert_simulation_contract(&first);
+    assert_eq!(first.records, repeat.records);
+    assert_eq!(first.status, SearchStatus::Acquired);
+    assert_eq!(repeat.status, first.status);
+    assert_eq!(
+        first.initial_pointing_error_rad,
+        repeat.initial_pointing_error_rad
+    );
+    assert!(first.initial_pointing_error_rad > BEAM_FWHM_RAD / 2.0);
+    assert!(first.plant_cycles > 0);
+    let confirmation = first.records.last().unwrap();
+    assert_eq!(confirmation.observation, Observation::Acquired);
+    assert!(confirmation.true_visible);
+    // The confirmation must reflect useful pointing, not a tiny beam-tail probability.
+    assert!(confirmation.pointing_error_rad < BEAM_FWHM_RAD);
+    assert!(
+        first.records[..first.records.len() - 1]
+            .iter()
+            .all(|step| step.observation == Observation::Miss)
+    );
+    assert!(!confirmation.resampled);
+}
+
+#[test]
+fn simulated_zero_probability_receiver_exhausts_the_search_budget() {
+    let result = run_simulation(ConstantModel(0.0)).unwrap();
+    assert_simulation_contract(&result);
+    assert_eq!(result.status, SearchStatus::Exhausted);
+    assert_eq!(result.plant_cycles, 32);
+    close(
+        (result.plant_time - result.setup.start).as_seconds(),
+        192.0,
+        1e-6,
+    );
+    assert!(result.records.iter().all(|step| {
+        step.observation == Observation::Miss && step.detection_probability == 0.0
+    }));
+}
+
+#[test]
+fn simulated_execution_errors_preserve_pending_action_and_receiver_randomness() {
+    let (mut controller, mut plant) = simulation::scenario().unwrap();
+    let (_, mut reference) = simulation::scenario().unwrap();
+    let action = controller.plan(&mut GaussianReceiver).unwrap().actions[0];
+    let mut wrong_cycle = action;
+    wrong_cycle.cycle += 1;
+    let mut wrong_timing = action;
+    wrong_timing.listen_start += Duration::from_seconds(1.0);
+    let mut below_mask = action;
+    below_mask.direction_enu = direction(0.0, -10.0);
+    let mut unreachable = action;
+    unreachable.direction_enu = EnuDirection::from_az_el(
+        controller.direction().az_el()[0] + std::f64::consts::PI,
+        10_f64.to_radians(),
+    )
+    .unwrap();
+    for rejected in [wrong_cycle, wrong_timing, below_mask, unreachable] {
+        assert!(plant.execute(rejected, &mut GaussianReceiver).is_err());
+    }
+    assert!(plant.execute(action, &mut FaultModel).is_err());
+    assert!(plant.execute(action, &mut MissingOutput).is_err());
+    assert!(plant.execute(action, &mut ConstantModel(f64::NAN)).is_err());
+    assert_eq!(controller.status(), SearchStatus::AwaitingObservation);
+    assert_eq!(controller.cycle(), 0);
+    let observation = plant.execute(action, &mut GaussianReceiver).unwrap();
+    assert_eq!(
+        observation,
+        reference.execute(action, &mut GaussianReceiver).unwrap()
+    );
+    assert!(plant.execute(action, &mut GaussianReceiver).is_err());
+    controller
+        .observe(observation.observation, || 0.375)
+        .unwrap();
+    assert_eq!(controller.cycle(), 1);
 }

@@ -1,13 +1,39 @@
 # Changelog
 
-## Unreleased
+## 0.9.3 — Unreleased
 
-- Add BC-MPC acquisition kernels and caller-driven controller state with
-  explicit weighted TLE/OMM hypotheses, private ATUS initialization, full-contact
-  prefix scoring, antenna motion constraints, and Bayesian miss/resampling updates.
-- Reuse prepared station geometry and share checked batch SGP4-to-GCRF
-  propagation with the existing TLE initializer. Add a reference acquisition loop
-  and deterministic kernel and controller regression tests.
+Intended release contents include all additions since 0.9.2. See the
+[feature outline](docs/release_0_9_3.md) for interfaces, integration, and validation.
+
+- Add the public `detection` module and `BcMpc` controller for Bayesian
+  Continuation MPC satellite acquisition from explicit weighted TLE/OMM hypotheses.
+- Build a private feasible ATUS continuation, then optimize a moving candidate
+  prefix against acquisition probability over the entire remaining search.
+  Preserve the continuation boundary and retain the incumbent plan when beam
+  search cannot improve its score.
+- Add particle-belief normalization, log-space Bayesian miss updates, effective
+  sample size, and caller-seeded systematic resampling. Cache geometry for the
+  original ephemeris pool and select active hypotheses by ancestor indices.
+- Add ENU pointing geometry, along-track candidates, elevation-mask checks,
+  rest-to-rest antenna slew constraints, and partial slews for initialization.
+- Add timed actions, acquisition/miss observations, explicit ready/pending/
+  acquired/exhausted states, and a caller-supplied `DetectionModel`. Planning
+  failures, unsupported misses, and invalid resampling draws preserve controller
+  state; execution failures leave the action pending rather than reporting a miss.
+- Add checked batch `kernels::propagate_sgp4_gcrf` for any Satkit `SGP4Source`,
+  including TLE and OMM, preserving epoch order and checking every propagation
+  status, output shape, frame conversion, and state. Reuse it in the existing
+  TLE initializer and combine it with prepared station geometry for acquisition.
+- Add a shared simulated plant and runnable `acquisition` example with an
+  independent true orbit, erroneous planning orbit, Gaussian receiver model,
+  separate seeded receiver/resampling streams, and per-cycle diagnostics.
+  The default fixture discovers the satellite in 12 simulated seconds.
+- Add acquisition regressions for kernel/reference agreement, constrained
+  planning, belief/resampling behavior, state transitions and error atomicity,
+  TLE/OMM geometry, reproducible simulated discovery, budget exhaustion, and
+  failed-execution retry behavior. Retain the forced-feedback controller test.
+- Add the acquisition API/defaults guide, README integration example, simulated
+  discovery instructions, and the satellite-search paper reference.
 
 ## 0.9.2
 

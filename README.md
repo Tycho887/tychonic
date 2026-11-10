@@ -24,7 +24,17 @@ See the [API documentation](https://docs.rs/tychonic) for available types and
 functions. `tychonic::satkit` and `tychonic::numeris` re-export the dependency
 versions accepted by the API.
 
-## Acquire with BC-MPC
+## Intended features for 0.9.3
+
+The next release adds BC-MPC satellite acquisition, weighted TLE/OMM beliefs,
+antenna-constrained search planning, Bayesian miss updates and resampling,
+shared checked batch SGP4 propagation, and a reproducible simulated discovery
+example. The [0.9.3 feature outline](docs/release_0_9_3.md) lists all additions
+since 0.9.2 and their validation. These features are available in this source
+tree; the package manifest and installation instructions still target 0.9.2
+until release preparation.
+
+## Acquire with BC-MPC (unreleased 0.9.3)
 
 `tychonic::detection` provides Bayesian Continuation MPC acquisition kernels
 and `BcMpc` state. Supply a nominal TLE or OMM, explicit particles and weights,
@@ -54,7 +64,8 @@ Execute only the first returned action. Report a miss only after successful
 execution of the full listening interval; an actuator or API error leaves it
 pending. Confirmation ends acquisition. Pointings and actuator limits use
 radians, distances metres, and durations seconds. See [acquisition API and
-defaults](docs/acquisition.md) and the [reference integration test](tests/acquisition.rs).
+defaults](docs/acquisition.md), the [simulated discovery example](examples/acquisition.rs),
+and the [reference integration test](tests/acquisition.rs).
 
 ## Prepare individual measurements
 
