@@ -3,7 +3,7 @@ use super::*;
 use satkit::{
     Frame, Instant, TLE, frametransform,
     orbitprop::{self, CovState, Integrator, PropSettings, SatPropertiesSimple, TideModel},
-    sgp4::{SGP4Error, sgp4},
+    sgp4::{SGP4Error, SGP4Source, sgp4},
 };
 
 /// Reference parameters are GCRF state, optionally followed by C_d A/m.
@@ -535,29 +535,49 @@ pub fn compute_sensitivities(
 
 #[allow(clippy::disallowed_methods)]
 pub fn initial_state_from_tle(tle: &TLE, epoch: &Instant) -> Result<V6> {
-    check_epochs(&tle.epoch, &[*epoch])?;
     let mut tle = tle.clone();
-    let out = sgp4(&mut tle, &[*epoch]).map_err(|e| KernelError::Tle(e.to_string()))?;
-    // Satkit's one-epoch API returns one position, velocity and status column.
-    // Check that boundary before using the fixed column index.
-    let status = out
-        .errcode
-        .first()
-        .ok_or(KernelError::Numerical("missing SGP4 status"))?;
-    if *status != SGP4Error::SGP4Success {
-        return Err(KernelError::Tle(status.to_string()));
+    propagate_sgp4_gcrf(&mut tle, &[*epoch])?
+        .into_iter()
+        .next()
+        .ok_or(KernelError::Numerical("missing SGP4 state"))
+}
+
+/// Batch SGP4 states in GCRF metres and metres/second, in caller epoch order.
+/// Accepts TLEs, OMMs, or other Satkit mean-element sources. Only the source's
+/// SGP4 cache is mutated. Every status and output is checked; empty grids work.
+pub fn propagate_sgp4_gcrf(source: &mut impl SGP4Source, times: &[Instant]) -> Result<Vec<V6>> {
+    check_epochs(&source.epoch(), times)?;
+    if times.is_empty() {
+        return Ok(Vec::new());
     }
-    if out.pos.nrows() != 3 || out.vel.nrows() != 3 || out.pos.ncols() != 1 || out.vel.ncols() != 1
+    let out = sgp4(source, times).map_err(|e| KernelError::Tle(e.to_string()))?;
+    if out.pos.nrows() != 3
+        || out.vel.nrows() != 3
+        || out.pos.ncols() != times.len()
+        || out.vel.ncols() != times.len()
+        || out.errcode.len() != times.len()
     {
         return Err(KernelError::Numerical("SGP4 output dimensions"));
     }
-    let r = V3::from_slice(out.pos.col_slice(0));
-    let v = V3::from_slice(out.vel.col_slice(0));
-    let (r, v) = frametransform::transform_state(Frame::TEME, Frame::GCRF, epoch, &r, &v)
-        .map_err(KernelError::Frame)?;
-    let state = v6_from(&r, &v);
-    check_state(&state)?;
-    Ok(state)
+    times
+        .iter()
+        .enumerate()
+        .map(|(i, time)| {
+            if out.errcode[i] != SGP4Error::SGP4Success {
+                return Err(KernelError::Tle(format!(
+                    "epoch index {i}: {}",
+                    out.errcode[i]
+                )));
+            }
+            let r = V3::from_slice(out.pos.col_slice(i));
+            let v = V3::from_slice(out.vel.col_slice(i));
+            let (r, v) = frametransform::transform_state(Frame::TEME, Frame::GCRF, time, &r, &v)
+                .map_err(KernelError::Frame)?;
+            let state = v6_from(&r, &v);
+            check_state(&state)?;
+            Ok(state)
+        })
+        .collect()
 }
 
 #[cfg(test)]

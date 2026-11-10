@@ -24,6 +24,38 @@ See the [API documentation](https://docs.rs/tychonic) for available types and
 functions. `tychonic::satkit` and `tychonic::numeris` re-export the dependency
 versions accepted by the API.
 
+## Acquire with BC-MPC
+
+`tychonic::detection` provides Bayesian Continuation MPC acquisition kernels
+and `BcMpc` state. Supply a nominal TLE or OMM, explicit particles and weights,
+and a communications model implementing `DetectionModel`. Initialization
+privately builds a feasible along-track continuation; each plan optimizes its
+prefix against acquisition probability over the entire remaining search.
+
+The caller owns the antenna, receiver, clock, and resampling randomness:
+
+```rust,no_run
+use tychonic::detection::{Action, BcMpc, DetectionModel, Observation,
+    Result, SearchStatus};
+
+fn acquire(mut controller: BcMpc, receiver: &mut impl DetectionModel,
+    mut execute: impl FnMut(Action) -> Result<Observation>,
+    mut uniform: impl FnMut() -> f64) -> Result<SearchStatus> {
+    while !controller.finished() {
+        let action = controller.plan(receiver)?.actions[0];
+        let observation = execute(action)?;
+        controller.observe(observation, &mut uniform)?;
+    }
+    Ok(controller.status())
+}
+```
+
+Execute only the first returned action. Report a miss only after successful
+execution of the full listening interval; an actuator or API error leaves it
+pending. Confirmation ends acquisition. Pointings and actuator limits use
+radians, distances metres, and durations seconds. See [acquisition API and
+defaults](docs/acquisition.md) and the [reference integration test](tests/acquisition.rs).
+
 ## Prepare individual measurements
 
 ```rust,no_run

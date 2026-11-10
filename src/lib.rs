@@ -2,7 +2,9 @@
 //!
 //! See [`kernels`] for geometric observations and analytic Jacobians,
 //! [`optim`] for prior-inclusive batch estimation, and [`estimate`] for EKF
-//! updates and RTS smoothing. States use GCRF metres and metres per second;
+//! updates and RTS smoothing. [`detection`] provides BC-MPC satellite
+//! acquisition from explicit weighted orbit hypotheses and receiver feedback.
+//! States use GCRF metres and metres per second;
 //! carrier frequencies are Hz and phases are continuous radians.
 //!
 //! [`numeris`] and [`satkit`] are re-exported so downstream projects can use
@@ -22,6 +24,7 @@
 )]
 pub use numeris;
 pub use satkit;
+pub mod detection;
 pub mod estimate;
 pub mod kernels;
 pub mod measurements;

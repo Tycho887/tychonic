@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add BC-MPC acquisition kernels and caller-driven controller state with
+  explicit weighted TLE/OMM hypotheses, private ATUS initialization, full-contact
+  prefix scoring, antenna motion constraints, and Bayesian miss/resampling updates.
+- Reuse prepared station geometry and share checked batch SGP4-to-GCRF
+  propagation with the existing TLE initializer. Add a reference acquisition loop
+  and deterministic kernel and controller regression tests.
+
 ## 0.9.2
 
 - Replace reference counting and interior mutability in Tychonic-owned code
