@@ -1,0 +1,138 @@
+name: Python bindings
+
+on:
+  push:
+    branches: [main]
+    tags: ['python-v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_to:
+        description: Index to publish to after validation (dispatch from a release tag)
+        type: choice
+        options: [none, testpypi, pypi]
+        default: none
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    env:
+      SATKIT_DATA: ${{ runner.temp }}/satkit-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            python -> target
+            tools -> target
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.SATKIT_DATA }}
+          key: satkit-data-0.24.1
+      - run: cargo run --locked --manifest-path tools/Cargo.toml --bin provision_data
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: '2_28'
+          args: --release --locked --out dist --interpreter python${{ matrix.python }} --compatibility manylinux_2_28
+      - run: python -m pip install numpy==1.26.4 satkit==0.24.1 pytest ruff
+        if: matrix.python == '3.11'
+      - run: python -m pip install numpy satkit==0.24.1 pytest ruff
+        if: matrix.python != '3.11'
+      - run: python -m pip install --no-deps dist/*.whl
+      - run: pytest -q python/tests
+        env:
+          SATKIT_OFFLINE: '1'
+      - run: python python/examples/fit_and_fuse.py
+        env:
+          SATKIT_OFFLINE: '1'
+      - run: python python/examples/tca_correction.py
+        env:
+          SATKIT_OFFLINE: '1'
+      - run: python python/examples/acquire.py
+        env:
+          SATKIT_OFFLINE: '1'
+      - run: ruff check python scripts/check_python_package.py
+      - run: ruff format --check python scripts/check_python_package.py
+      - run: cargo fmt --manifest-path python/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path python/Cargo.toml --locked --all-targets -- -D warnings
+      - run: python scripts/check_python_package.py dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.python }}
+          path: dist/*.whl
+
+  sdist:
+    runs-on: ubuntu-latest
+    env:
+      SATKIT_DATA: ${{ runner.temp }}/satkit-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            python -> target
+            tools -> target
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.SATKIT_DATA }}
+          key: satkit-data-0.24.1
+      - run: cargo run --locked --manifest-path tools/Cargo.toml --bin provision_data
+      - run: python -m pip install build 'maturin>=1.10,<2' numpy satkit==0.24.1 pytest
+      - run: python -m build --outdir dist
+      - run: python scripts/check_python_package.py dist
+      - run: python -m pip install --no-deps dist/*.whl
+      - run: pytest -q python/tests
+        env:
+          SATKIT_OFFLINE: '1'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_to != 'none'
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.publish_to }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: python scripts/check_python_package.py dist --tag "$RELEASE_TAG"
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+      - run: python -m pip install twine
+      - run: python -m twine check dist/*
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: inputs.publish_to == 'testpypi'
+        with:
+          repository-url: https://test.pypi.org/legacy/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: inputs.publish_to == 'pypi'

@@ -1,0 +1,59 @@
+[build-system]
+requires = ["maturin>=1.10,<2"]
+build-backend = "maturin"
+
+[project]
+name = "tychonic"
+version = "0.1.0"
+description = "Orbit determination, sensor fusion, and satellite acquisition backed by Rust"
+readme = "python/README.md"
+requires-python = ">=3.11,<3.15"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+dependencies = ["numpy>=1.26", "satkit==0.24.1"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+[project.urls]
+Repository = "https://github.com/Tycho887/tychonic"
+Documentation = "https://github.com/Tycho887/tychonic/blob/main/docs/python.md"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "ruff>=0.9", "radon>=6"]
+
+[tool.maturin]
+manifest-path = "python/Cargo.toml"
+python-source = "python"
+module-name = "tychonic._native"
+locked = true
+include = [
+    { path = "python/tests/*.py", format = "sdist" },
+    { path = "python/tests/data/*.json", format = "sdist" },
+    { path = "python/examples/*.py", format = "sdist" },
+    { path = "python/examples/*.rs", format = "sdist" },
+    { path = "docs/python*.md", format = "sdist" },
+]
+exclude = [
+    "**/__pycache__/**", "**/*.pyc", ".venv/**", ".pytest_cache/**",
+    ".aws/**", ".codex/**", ".agents/**", "python/target/**",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
