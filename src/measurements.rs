@@ -13,7 +13,6 @@ use crate::optim::{
 };
 use numeris::{DynMatrix, DynVector, Matrix, Vector, dynmatrix::DynCholesky, optim::LmSettings};
 use satkit::Instant;
-use std::ops::Deref;
 
 mod rf;
 pub use rf::{GaussianPrior, RfBuilder, RfPriors};
@@ -25,25 +24,67 @@ pub type OrbitFilterWithDrag = OrbitEkf<7>;
 
 /// A calibrated measurement model. Offsets are known constants in physical units.
 /// A joint model may contain each variant once, with independent RF baselines.
-#[derive(Clone, Copy, Debug)]
-pub enum Observable {
+/// Baselines are antenna 1 minus antenna 2 in antenna 1's ENU frame, in metres.
+/// `B` is `V3` for sensors and `Vec<V3>` in measurement order for batches.
+#[derive(Copy, Debug)]
+pub enum Observable<B = V3> {
     Doppler {
         carrier_hz: f64,
         offset_hz: f64,
     },
     PhaseDifference {
         interferometer: Interferometer,
+        baseline_enu_m: B,
         frequency_offset_hz: f64,
         phase_offset_rad: f64,
     },
     DifferentialDoppler {
         interferometer: Interferometer,
+        baseline_enu_m: B,
     },
     AzimuthElevation,
 }
 
-impl Observable {
-    fn order(self) -> usize {
+impl<B: Copy> Clone for Observable<B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<B> Observable<B> {
+    /// Transform the RF baseline input, for example from a sensor vector to
+    /// repeated per-measurement vectors using `|b| vec![b; measurements]`.
+    pub fn map_baseline<C>(self, map: impl FnOnce(B) -> C) -> Observable<C> {
+        match self {
+            Self::Doppler {
+                carrier_hz,
+                offset_hz,
+            } => Observable::Doppler {
+                carrier_hz,
+                offset_hz,
+            },
+            Self::PhaseDifference {
+                interferometer,
+                baseline_enu_m,
+                frequency_offset_hz,
+                phase_offset_rad,
+            } => Observable::PhaseDifference {
+                interferometer,
+                baseline_enu_m: map(baseline_enu_m),
+                frequency_offset_hz,
+                phase_offset_rad,
+            },
+            Self::DifferentialDoppler {
+                interferometer,
+                baseline_enu_m,
+            } => Observable::DifferentialDoppler {
+                interferometer,
+                baseline_enu_m: map(baseline_enu_m),
+            },
+            Self::AzimuthElevation => Observable::AzimuthElevation,
+        }
+    }
+    fn order(&self) -> usize {
         match self {
             Self::Doppler { .. } => 0,
             Self::PhaseDifference { .. } => 1,
@@ -51,12 +92,12 @@ impl Observable {
             Self::AzimuthElevation => 3,
         }
     }
-    fn validate(self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         match self {
             Self::Doppler {
                 carrier_hz,
                 offset_hz,
-            } if !carrier_hz.is_finite() || carrier_hz <= 0.0 || !offset_hz.is_finite() => {
+            } if !carrier_hz.is_finite() || *carrier_hz <= 0.0 || !offset_hz.is_finite() => {
                 Err(KernelError::InvalidInput("Doppler carrier/offset"))
             }
             Self::PhaseDifference {
@@ -69,7 +110,7 @@ impl Observable {
             _ => Ok(()),
         }
     }
-    fn dimension(self) -> usize {
+    fn dimension(&self) -> usize {
         if matches!(self, Self::AzimuthElevation) {
             2
         } else {
@@ -79,10 +120,31 @@ impl Observable {
 }
 
 #[derive(Debug)]
-pub(crate) struct Model(Box<[Observable]>);
+pub(crate) struct Model<B>(Box<[Observable<B>]>);
 
-impl Model {
-    fn new(mut observables: Vec<Observable>) -> Result<Self> {
+pub(crate) trait Baseline {
+    fn validate(&self, measurements: usize) -> Result<()>;
+    fn at(&self, row: usize) -> &V3;
+}
+impl Baseline for V3 {
+    fn validate(&self, _: usize) -> Result<()> {
+        validate_baseline(self)
+    }
+    fn at(&self, _: usize) -> &V3 {
+        self
+    }
+}
+impl Baseline for Vec<V3> {
+    fn validate(&self, measurements: usize) -> Result<()> {
+        validate_baselines(self, measurements)
+    }
+    fn at(&self, row: usize) -> &V3 {
+        &self[row]
+    }
+}
+
+impl<B: Baseline> Model<B> {
+    fn new(mut observables: Vec<Observable<B>>, measurements: usize) -> Result<Self> {
         if observables.is_empty() {
             return Err(KernelError::InvalidInput("empty observable selection"));
         }
@@ -92,6 +154,13 @@ impl Model {
         }
         for observable in &observables {
             observable.validate()?;
+            match observable {
+                Observable::PhaseDifference { baseline_enu_m, .. }
+                | Observable::DifferentialDoppler { baseline_enu_m, .. } => {
+                    baseline_enu_m.validate(measurements)?
+                }
+                _ => {}
+            }
         }
         Ok(Self(observables.into()))
     }
@@ -109,12 +178,13 @@ impl Model {
         state: &V6,
         geometry: &StationGeometry,
         time: Instant,
+        measurement: usize,
     ) -> Result<(Vector<f64, 5>, Matrix<f64, 5, 6>)> {
         let mut value = Vector::zeros();
         let mut partial = Matrix::zeros();
         let mut row = 0;
         for observable in self.0.iter() {
-            match *observable {
+            match observable {
                 Observable::Doppler {
                     carrier_hz,
                     offset_hz,
@@ -126,22 +196,34 @@ impl Model {
                         geometry.velocity(),
                     )?;
                     let scale = -carrier_hz / SPEED_OF_LIGHT;
-                    value[row] = scale * rr + offset_hz;
+                    value[row] = scale * rr + *offset_hz;
                     partial.set_block(row, 0, &(h * scale));
                 }
                 Observable::PhaseDifference {
                     interferometer,
+                    baseline_enu_m,
                     frequency_offset_hz,
                     phase_offset_rad,
                 } => {
-                    let pred = interferometer.evaluate(state, geometry, frequency_offset_hz)?;
+                    let pred = interferometer.evaluate(
+                        state,
+                        geometry,
+                        baseline_enu_m.at(measurement),
+                        *frequency_offset_hz,
+                    )?;
                     value[row] = pred.phase_rad + phase_offset_rad;
-                    for k in 0..6 {
-                        partial[(row, k)] = pred.partial[(1, k)];
-                    }
+                    partial.set_block(row, 0, &pred.partial.block::<1, 6>(1, 0));
                 }
-                Observable::DifferentialDoppler { interferometer } => {
-                    let pred = interferometer.differential(state, geometry, time)?;
+                Observable::DifferentialDoppler {
+                    interferometer,
+                    baseline_enu_m,
+                } => {
+                    let pred = interferometer.differential(
+                        state,
+                        geometry,
+                        baseline_enu_m.at(measurement),
+                        time,
+                    )?;
                     value[row] = pred.difference_hz;
                     partial.set_block(row, 0, &pred.partial);
                 }
@@ -174,15 +256,25 @@ impl Model {
 
 #[derive(Debug)]
 enum ModelSource<'g> {
-    Owned(Model),
-    Borrowed(&'g Model),
+    Owned(Model<V3>),
+    Borrowed(&'g Model<Vec<V3>>, usize),
 }
-impl Deref for ModelSource<'_> {
-    type Target = Model;
-    fn deref(&self) -> &Model {
+impl ModelSource<'_> {
+    fn predict(
+        &self,
+        state: &V6,
+        geometry: &StationGeometry,
+        time: Instant,
+    ) -> Result<(Vector<f64, 5>, Matrix<f64, 5, 6>)> {
         match self {
-            Self::Owned(model) => model,
-            Self::Borrowed(model) => model,
+            Self::Owned(model) => model.predict(state, geometry, time, 0),
+            Self::Borrowed(model, row) => model.predict(state, geometry, time, *row),
+        }
+    }
+    fn azimuth_column(&self) -> Option<usize> {
+        match self {
+            Self::Owned(model) => model.azimuth_column(),
+            Self::Borrowed(model, _) => model.azimuth_column(),
         }
     }
 }
@@ -225,7 +317,7 @@ pub fn joint_sensor<'g, const M: usize>(
     time: Instant,
     observables: Vec<Observable>,
 ) -> Result<CalibratedSensor<'g, M>> {
-    let model = Model::new(observables)?;
+    let model = Model::new(observables, 1)?;
     if M != model.dimension() {
         return Err(KernelError::InvalidInput(
             "sensor dimension does not match observables",
@@ -256,12 +348,14 @@ pub fn phase_difference_sensor<'g>(
     geometry: impl Into<StationGeometrySource<'g>>,
     time: Instant,
     interferometer: Interferometer,
+    baseline_enu_m: V3,
 ) -> Result<CalibratedSensor<'g, 1>> {
     joint_sensor(
         geometry,
         time,
         vec![Observable::PhaseDifference {
             interferometer,
+            baseline_enu_m,
             frequency_offset_hz: 0.0,
             phase_offset_rad: 0.0,
         }],
@@ -271,11 +365,15 @@ pub fn differential_doppler_sensor<'g>(
     geometry: impl Into<StationGeometrySource<'g>>,
     time: Instant,
     interferometer: Interferometer,
+    baseline_enu_m: V3,
 ) -> Result<CalibratedSensor<'g, 1>> {
     joint_sensor(
         geometry,
         time,
-        vec![Observable::DifferentialDoppler { interferometer }],
+        vec![Observable::DifferentialDoppler {
+            interferometer,
+            baseline_enu_m,
+        }],
     )
 }
 pub fn azimuth_elevation_sensor<'g>(
@@ -291,12 +389,12 @@ pub fn azimuth_elevation_sensor<'g>(
 /// Different schedules should be supplied as separate batches to `fit`/`filter_batches`.
 pub fn joint<'g>(
     geometry: impl Into<GeometrySource<'g>>,
-    observables: Vec<Observable>,
+    observables: Vec<Observable<Vec<V3>>>,
     values: Vec<Vec<f64>>,
     covariances: Vec<DynMatrix<f64>>,
 ) -> Result<PreparedBatch<'g>> {
     let geometry = geometry.into();
-    let model = Model::new(observables)?;
+    let model = Model::new(observables, geometry.len())?;
     let m = model.dimension();
     if geometry.is_empty()
         || values.len() != geometry.len()
@@ -358,14 +456,12 @@ fn valid_noise_sigma(sigma: f64) -> bool {
     sigma.is_finite() && sigma > 0.0 && sigma.powi(2).is_finite() && sigma.powi(2) != 0.0
 }
 
-fn independent<'g>(
-    geometry: impl Into<GeometrySource<'g>>,
-    observables: Vec<Observable>,
-    columns: Vec<Vec<f64>>,
+fn validate_independent_columns(
+    columns: &[Vec<f64>],
     sigmas: &[f64],
-) -> Result<PreparedBatch<'g>> {
-    let geometry = geometry.into();
-    if columns.iter().any(|c| c.len() != geometry.len())
+    measurements: usize,
+) -> Result<()> {
+    if columns.iter().any(|c| c.len() != measurements)
         || sigmas.len() != columns.len()
         || sigmas.iter().any(|s| !valid_noise_sigma(*s))
     {
@@ -373,6 +469,17 @@ fn independent<'g>(
             "observation lengths or noise sigmas",
         ));
     }
+    Ok(())
+}
+
+fn independent<'g>(
+    geometry: impl Into<GeometrySource<'g>>,
+    observables: Vec<Observable<Vec<V3>>>,
+    columns: Vec<Vec<f64>>,
+    sigmas: &[f64],
+) -> Result<PreparedBatch<'g>> {
+    let geometry = geometry.into();
+    validate_independent_columns(&columns, sigmas, geometry.len())?;
     let values = (0..geometry.len())
         .map(|i| columns.iter().map(|c| c[i]).collect())
         .collect();
@@ -380,7 +487,7 @@ fn independent<'g>(
     for (i, sigma) in sigmas.iter().enumerate() {
         covariance[(i, i)] = sigma.powi(2);
     }
-    let model = Model::new(observables)?;
+    let model = Model::new(observables, geometry.len())?;
     if geometry.is_empty() || model.dimension() != columns.len() {
         return Err(KernelError::InvalidInput("joint observation dimensions"));
     }
@@ -420,9 +527,11 @@ pub fn doppler<'g>(
     )
 }
 /// Continuous, unwrapped phase difference in radians, with calibrated offsets.
+/// Supply one ENU baseline vector per measurement; repeat vectors for fixed baselines.
 pub fn phase_difference<'g>(
     geometry: impl Into<GeometrySource<'g>>,
     interferometer: Interferometer,
+    baselines_enu_m: Vec<V3>,
     values_rad: Vec<f64>,
     sigma_rad: f64,
 ) -> Result<PreparedBatch<'g>> {
@@ -430,6 +539,7 @@ pub fn phase_difference<'g>(
         geometry,
         vec![Observable::PhaseDifference {
             interferometer,
+            baseline_enu_m: baselines_enu_m,
             frequency_offset_hz: 0.0,
             phase_offset_rad: 0.0,
         }],
@@ -438,15 +548,20 @@ pub fn phase_difference<'g>(
     )
 }
 /// Signed f1 − f2 in Hz. No ordinary Doppler or phase observations are required.
+/// Supply one ENU baseline vector per measurement; repeat vectors for fixed baselines.
 pub fn differential_doppler<'g>(
     geometry: impl Into<GeometrySource<'g>>,
     interferometer: Interferometer,
+    baselines_enu_m: Vec<V3>,
     values_hz: Vec<f64>,
     sigma_hz: f64,
 ) -> Result<PreparedBatch<'g>> {
     independent(
         geometry,
-        vec![Observable::DifferentialDoppler { interferometer }],
+        vec![Observable::DifferentialDoppler {
+            interferometer,
+            baseline_enu_m: baselines_enu_m,
+        }],
         vec![values_hz],
         &[sigma_hz],
     )
@@ -525,7 +640,7 @@ pub fn fit_with_covariance<'g>(
 
 #[derive(Debug)]
 pub(crate) struct JointBatch {
-    model: Model,
+    model: Model<Vec<V3>>,
     values: Vec<Vec<f64>>,
     noise: Noise,
 }
@@ -575,7 +690,7 @@ impl JointBatch {
             value,
             covariance,
             model: CalibratedSensor {
-                model: ModelSource::Borrowed(&self.model),
+                model: ModelSource::Borrowed(&self.model, row),
                 geometry: StationGeometrySource::Borrowed(
                     geometry
                         .row(row)
@@ -603,7 +718,7 @@ impl JointBatch {
                 stm: &sens.stm[index],
                 state_dcd: sens.state_dcd.get(index),
             };
-            let (predicted, partial) = self.model.predict(sample.state, station, sample.time)?;
+            let (predicted, partial) = self.model.predict(sample.state, station, sample.time, i)?;
             self.write_row(i, &predicted, &partial, &sample, output, offset, p)?;
         }
         Ok(())

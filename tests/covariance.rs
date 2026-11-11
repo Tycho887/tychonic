@@ -119,18 +119,22 @@ fn fixture(
         .collect();
     let geometry = PreparedGeometry::new(&times, &stations).unwrap();
     let sens = config(drag).sample(&x, &times).unwrap();
-    let interferometer = Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9).unwrap();
-    let models = vec![
+    let interferometer = Interferometer::new(2.23e9).unwrap();
+    let models = [
         Observable::Doppler {
             carrier_hz: 2.23e9,
             offset_hz: 0.0,
         },
         Observable::PhaseDifference {
             interferometer,
+            baseline_enu_m: baseline(),
             frequency_offset_hz: 0.0,
             phase_offset_rad: 0.0,
         },
-        Observable::DifferentialDoppler { interferometer },
+        Observable::DifferentialDoppler {
+            interferometer,
+            baseline_enu_m: baseline(),
+        },
         Observable::AzimuthElevation,
     ];
     let sigmas = [0.5, 0.01, 0.7, 1e-4, 2e-4];
@@ -147,9 +151,12 @@ fn fixture(
                 * range_rate_partial(&r_of(state), &v_of(state), g.position(), g.velocity())
                     .unwrap()
                     .0,
-            interferometer.evaluate(state, g, 0.0).unwrap().phase_rad,
             interferometer
-                .differential(state, g, times[i])
+                .evaluate(state, g, &baseline(), 0.0)
+                .unwrap()
+                .phase_rad,
+            interferometer
+                .differential(state, g, &baseline(), times[i])
                 .unwrap()
                 .difference_hz,
         ];
@@ -168,7 +175,11 @@ fn fixture(
         batches.push(
             m::joint(
                 PreparedGeometry::new(&[times[i]], &[stations[i]]).unwrap(),
-                models.clone(),
+                models
+                    .iter()
+                    .copied()
+                    .map(|o| o.map_baseline(|b| vec![b]))
+                    .collect(),
                 vec![z],
                 vec![noise.clone()],
             )
@@ -327,4 +338,8 @@ fn generation_two_fixture_has_later_held_out_observations() {
     if let Ok(path) = std::env::var("DART_FIXTURE_OUTPUT") {
         std::fs::write(path, fixture).unwrap();
     }
+}
+
+fn baseline() -> V3 {
+    v3(59.0, 3.0, 0.2)
 }

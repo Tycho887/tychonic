@@ -36,16 +36,25 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         od_prop_settings(),
         ParameterMode::StateOnly { fixed_drag: 0.02 },
     )?;
-    let interferometer = Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9)?;
+    let baseline_enu_m = v3(59.0, 3.0, 0.2);
+    let interferometer = Interferometer::new(2.23e9)?;
     let orbit_mean = DynVector::from_slice(initial.as_slice());
     let states = config.sample(&orbit_mean, &times)?;
     let predictions = (0..times.len())
-        .map(|i| interferometer.evaluate(&states.states()[i], geometry.row(i).unwrap(), 3.0))
+        .map(|i| {
+            interferometer.evaluate(
+                &states.states()[i],
+                geometry.row(i).unwrap(),
+                &baseline_enu_m,
+                3.0,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     // Replace these synthetic values with extracted receiver observations.
     let data = PassiveRfData::new(
         geometry,
         interferometer,
+        vec![baseline_enu_m; times.len()],
         predictions.iter().map(|p| p.doppler_hz).collect(),
         Some(predictions.iter().map(|p| p.phase_rad + 0.2).collect()),
         0.5,

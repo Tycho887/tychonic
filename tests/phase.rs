@@ -28,7 +28,7 @@ fn geometry(times: &[Instant]) -> PreparedGeometry {
     .unwrap()
 }
 fn interferometer() -> Interferometer {
-    Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9).unwrap()
+    Interferometer::new(2.23e9).unwrap()
 }
 fn ou() -> OuPhaseNoise {
     OuPhaseNoise::new(21600.0, 5.0_f64.to_radians()).unwrap()
@@ -101,25 +101,33 @@ fn phase_validation_zero_baseline_and_zenith() {
         &(g.position() + g.rotation().to_gcrf(&v3(0.0, 0.0, 400e3))),
         g.velocity(),
     );
-    assert!(interferometer().evaluate(&zenith, g, 0.0).is_ok());
-    let zero = Interferometer::new(V3::zeros(), 2.23e9)
+    assert!(
+        interferometer()
+            .evaluate(&zenith, g, &baseline(), 0.0)
+            .is_ok()
+    );
+    let zero = Interferometer::new(2.23e9)
         .unwrap()
-        .evaluate(&zenith, g, 0.0)
+        .evaluate(&zenith, g, &V3::zeros(), 0.0)
         .unwrap();
     assert_eq!(zero.phase_rad, 0.0);
     for k in 0..6 {
         assert_eq!(zero.partial[(1, k)], 0.0);
     }
-    assert!(Interferometer::new(v3(f64::NAN, 0.0, 0.0), 2.23e9).is_err());
-    assert!(Interferometer::new(V3::zeros(), 0.0).is_err());
     assert!(
         interferometer()
-            .evaluate(&v6_from(g.position(), g.velocity()), g, 0.0)
+            .evaluate(&zenith, g, &v3(f64::NAN, 0.0, 0.0), 0.0)
+            .is_err()
+    );
+    assert!(Interferometer::new(0.0).is_err());
+    assert!(
+        interferometer()
+            .evaluate(&v6_from(g.position(), g.velocity()), g, &baseline(), 0.0)
             .is_err()
     );
     assert!(
         interferometer()
-            .evaluate(&zenith, g, f64::INFINITY)
+            .evaluate(&zenith, g, &baseline(), f64::INFINITY)
             .is_err()
     );
     assert!(OuPhaseNoise::new(0.0, 1.0).is_err());
@@ -167,7 +175,7 @@ fn fixture(mode: ParameterMode, offsets: &[f64]) -> (PassiveRfProblem<'static>, 
     let predictions: Vec<_> = (0..times.len())
         .map(|i| {
             interferometer()
-                .evaluate(&s.states()[i], g.row(i).unwrap(), 2.0)
+                .evaluate(&s.states()[i], g.row(i).unwrap(), &baseline(), 2.0)
                 .unwrap()
         })
         .collect();
@@ -179,6 +187,7 @@ fn fixture(mode: ParameterMode, offsets: &[f64]) -> (PassiveRfProblem<'static>, 
     let data = PassiveRfData::new(
         g,
         interferometer(),
+        vec![baseline(); times.len()],
         predictions.iter().map(|v| v.doppler_hz).collect(),
         Some(predictions.iter().map(|v| v.phase_rad + 0.7).collect()),
         0.3,
@@ -253,19 +262,31 @@ fn phase_prepared_batch_and_sensor_share_kernel_and_filter_schedule() {
     let phases: Vec<_> = (0..3)
         .map(|i| {
             interferometer()
-                .evaluate(&s.states()[i], data.geometry().row(i).unwrap(), 0.0)
+                .evaluate(
+                    &s.states()[i],
+                    data.geometry().row(i).unwrap(),
+                    &baseline(),
+                    0.0,
+                )
                 .unwrap()
                 .phase_rad
         })
         .collect();
-    let batch =
-        PreparedBatch::phase_difference(data.geometry(), interferometer(), phases, 0.01).unwrap();
+    let batch = PreparedBatch::phase_difference(
+        data.geometry(),
+        interferometer(),
+        vec![baseline(); data.geometry().len()],
+        phases,
+        0.01,
+    )
+    .unwrap();
     let e = batch.evaluate_from_sensitivities(&s).unwrap();
     assert!(e.rss() < 1e-15);
     for i in 0..3 {
         let sensor = PhaseSensor {
             geometry: data.geometry().row(i).unwrap().into(),
             interferometer: interferometer(),
+            baseline_enu_m: baseline(),
         };
         let (_, h) = sensor.evaluate(&s.states()[i]).unwrap();
         let chained = h * s.stm()[i];
@@ -325,6 +346,7 @@ fn augmented_filter_same_epoch_matches_batch_information_solution() {
         PassiveRfData::new(
             data.geometry(),
             data.interferometer(),
+            data.baselines_enu_m().to_vec(),
             invalid,
             data.phase_rad().map(<[f64]>::to_vec),
             data.sigma_doppler_hz(),
@@ -338,6 +360,7 @@ fn augmented_filter_same_epoch_matches_batch_information_solution() {
             &Vector::from_array([1e9]),
             problem.data().geometry().row(0).unwrap(),
             interferometer(),
+            &baseline(),
             &Matrix::new([[1.0]]),
             UpdateOptions { gate: Some(1.0) },
         )
@@ -432,6 +455,7 @@ fn noisy_pass_recovers_offsets_and_supports_augmented_drag() {
     let data = PassiveRfData::new(
         original.geometry(),
         original.interferometer(),
+        original.baselines_enu_m().to_vec(),
         doppler,
         Some(phase),
         original.sigma_doppler_hz(),
@@ -479,4 +503,8 @@ fn iteration_limit_requires_verified_local_convergence() {
     bad[0] += 1000.0;
     bad[3] += 1.0;
     assert!(fit_passive_rf(&problem, &bad, &settings).is_err());
+}
+
+fn baseline() -> V3 {
+    v3(59.0, 3.0, 0.2)
 }

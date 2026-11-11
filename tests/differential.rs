@@ -54,7 +54,7 @@ fn setup() -> (
         .unwrap(),
         g,
         x,
-        Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9).unwrap(),
+        Interferometer::new(2.23e9).unwrap(),
         prior,
     )
 }
@@ -69,7 +69,9 @@ fn exact_differential_state_and_baseline_jacobians_match_central_differences() {
         let row = g.row(i).unwrap();
         let t = g.timestamps()[i];
         let x = s.states()[i];
-        let predicted = interferometer.differential(&x, row, t).unwrap();
+        let predicted = interferometer
+            .differential(&x, row, &baseline(), t)
+            .unwrap();
         for k in 0..6 {
             let step = if k < 3 { 5.0 } else { 1.0 };
             let mut xp = x;
@@ -77,11 +79,11 @@ fn exact_differential_state_and_baseline_jacobians_match_central_differences() {
             xp[k] += step;
             xm[k] -= step;
             let fd = (interferometer
-                .differential(&xp, row, t)
+                .differential(&xp, row, &baseline(), t)
                 .unwrap()
                 .difference_hz
                 - interferometer
-                    .differential(&xm, row, t)
+                    .differential(&xm, row, &baseline(), t)
                     .unwrap()
                     .difference_hz)
                 / (2.0 * step);
@@ -91,19 +93,15 @@ fn exact_differential_state_and_baseline_jacobians_match_central_differences() {
             let mut delta = V3::zeros();
             delta[k] = 0.01;
             let a = interferometer
-                .corrected(&delta)
-                .unwrap()
-                .differential(&x, row, t)
+                .differential(&x, row, &(baseline() + delta), t)
                 .unwrap();
             let b = interferometer
-                .corrected(&(-delta))
-                .unwrap()
-                .differential(&x, row, t)
+                .differential(&x, row, &(baseline() + (-delta)), t)
                 .unwrap();
             let fd = (a.difference_hz - b.difference_hz) / 0.02;
             assert!((fd - predicted.baseline_partial[(0, k)]).abs() < 1e-7 + 1e-5 * fd.abs());
         }
-        let baseline = row.rotation().to_gcrf(interferometer.baseline_enu());
+        let baseline = row.rotation().to_gcrf(&baseline());
         let omega = satkit::frametransform::qitrf2gcrf_approx(&t)
             * v3(0.0, 0.0, satkit::consts::OMEGA_EARTH);
         let rho = r_of(&x) - row.position();
@@ -121,16 +119,16 @@ fn spherical_phase_has_stable_paths_and_analytic_state_baseline_partials() {
     let (_, g, x, int, _) = setup();
     let row = g.row(0).unwrap();
     let int = int.with_spherical_phase();
-    let pred = int.evaluate(&x, row, 2.0).unwrap();
-    assert!(int.corrected(&V3::zeros()).unwrap().uses_spherical_phase());
+    let pred = int.evaluate(&x, row, &baseline(), 2.0).unwrap();
+    assert!(int.uses_spherical_phase());
     for k in 0..6 {
         let step = if k < 3 { 0.5 } else { 0.1 };
         let mut xp = x;
         let mut xm = x;
         xp[k] += step;
         xm[k] -= step;
-        let fd = (int.evaluate(&xp, row, 2.0).unwrap().phase_rad
-            - int.evaluate(&xm, row, 2.0).unwrap().phase_rad)
+        let fd = (int.evaluate(&xp, row, &baseline(), 2.0).unwrap().phase_rad
+            - int.evaluate(&xm, row, &baseline(), 2.0).unwrap().phase_rad)
             / (2.0 * step);
         assert!((fd - pred.partial[(1, k)]).abs() < 2e-9 + 1e-5 * fd.abs());
     }
@@ -139,22 +137,18 @@ fn spherical_phase_has_stable_paths_and_analytic_state_baseline_partials() {
         let mut delta = V3::zeros();
         delta[k] = 0.001;
         let fd = (int
-            .corrected(&delta)
-            .unwrap()
-            .evaluate(&x, row, 2.0)
+            .evaluate(&x, row, &(baseline() + delta), 2.0)
             .unwrap()
             .phase_rad
             - int
-                .corrected(&(-delta))
-                .unwrap()
-                .evaluate(&x, row, 2.0)
+                .evaluate(&x, row, &(baseline() + (-delta)), 2.0)
                 .unwrap()
                 .phase_rad)
             / 0.002;
         assert!((fd - h[(0, k)]).abs() < 1e-7);
     }
     let rho = r_of(&x) - row.position();
-    let b = row.rotation().to_gcrf(int.baseline_enu());
+    let b = row.rotation().to_gcrf(&baseline());
     let path = (rho + b).norm() - rho.norm();
     let frequency = int.carrier_hz() + pred.doppler_hz;
     assert!(
@@ -166,15 +160,16 @@ fn spherical_phase_has_stable_paths_and_analytic_state_baseline_partials() {
 #[test]
 fn zero_baseline_cancellation_and_shared_noise_covariance() {
     let (_, g, x, _, _) = setup();
-    let zero = Interferometer::new(V3::zeros(), 2.23e9)
+    let zero = Interferometer::new(2.23e9)
         .unwrap()
-        .differential(&x, g.row(0).unwrap(), epoch())
+        .differential(&x, g.row(0).unwrap(), &V3::zeros(), epoch())
         .unwrap();
     assert_eq!(zero.difference_hz, 0.0);
     assert_eq!(zero.partial, Matrix::<f64, 1, 6>::zeros());
     let data = PassiveRfData::new(
         g,
-        Interferometer::new(V3::zeros(), 2.23e9).unwrap(),
+        Interferometer::new(2.23e9).unwrap(),
+        vec![V3::zeros(); 3],
         vec![0.0; 3],
         Some(vec![0.0; 3]),
         0.3,
@@ -204,6 +199,7 @@ fn zero_baseline_cancellation_and_shared_noise_covariance() {
     let no_phase = PassiveRfData::new(
         data.geometry(),
         data.interferometer(),
+        data.baselines_enu_m().to_vec(),
         data.doppler_hz().to_vec(),
         None,
         data.sigma_doppler_hz(),
@@ -264,7 +260,8 @@ fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
     let e = problem.evaluate(&problem.initial_parameters()).unwrap();
     assert!(e.rss() < 1e-12);
     let (first, second) = polar_sites();
-    let remote = Interferometer::new(first.baseline_enu_to(&second).unwrap(), 2.23e9).unwrap();
+    let remote_baseline = first.baseline_enu_to(&second).unwrap();
+    let remote = Interferometer::new(2.23e9).unwrap();
     let times = problem.data().geometry().timestamps();
     let states = problem
         .config()
@@ -274,13 +271,19 @@ fn estimated_drag_and_baseline_have_explicit_augmented_layouts() {
         .to_vec();
     let mut ext = copy_extensions(problem.extensions());
     ext.differential_interferometer = Some(remote);
+    ext.differential_baselines_enu_m = Some(vec![remote_baseline; times.len()]);
     ext.differential_baseline_sigma_m = Some(v3(0.005, 0.005, 0.005));
     ext.differential_doppler.as_mut().unwrap().difference_hz = states
         .iter()
         .enumerate()
         .map(|(i, x)| {
             remote
-                .differential(x, problem.data().geometry().row(i).unwrap(), times[i])
+                .differential(
+                    x,
+                    problem.data().geometry().row(i).unwrap(),
+                    &remote_baseline,
+                    times[i],
+                )
                 .unwrap()
                 .difference_hz
         })
@@ -324,16 +327,21 @@ fn problem(same_epoch: bool) -> (PassiveRfProblem<'static>, DynVector<f64>) {
         .unwrap();
     let predictions: Vec<_> = (0..g.len())
         .map(|i| {
-            int.evaluate(&s.states()[i], g.row(i).unwrap(), 2.0)
+            int.evaluate(&s.states()[i], g.row(i).unwrap(), &baseline(), 2.0)
                 .unwrap()
         })
         .collect();
     let dd = DifferentialDopplerData {
         difference_hz: (0..g.len())
             .map(|i| {
-                int.differential(&s.states()[i], g.row(i).unwrap(), g.timestamps()[i])
-                    .unwrap()
-                    .difference_hz
+                int.differential(
+                    &s.states()[i],
+                    g.row(i).unwrap(),
+                    &baseline(),
+                    g.timestamps()[i],
+                )
+                .unwrap()
+                .difference_hz
             })
             .collect(),
         sigma_antenna2_hz: 0.3,
@@ -341,6 +349,7 @@ fn problem(same_epoch: bool) -> (PassiveRfProblem<'static>, DynVector<f64>) {
     let data = PassiveRfData::new(
         g,
         int,
+        vec![baseline(); s.timestamps().len()],
         predictions.iter().map(|p| p.doppler_hz).collect(),
         Some(predictions.iter().map(|p| p.phase_rad + 0.7).collect()),
         0.3,
@@ -462,7 +471,7 @@ fn continental_chord_matches_independent_station_geometry_and_exact_range_rates(
     // Curvature produces a large up component: a surface distance in a flat
     // local plane is not the vector joining the two antenna reference points.
     assert!(b[2] > 70e3);
-    let int = Interferometer::new(b, 2.23e9).unwrap();
+    let int = Interferometer::new(2.23e9).unwrap();
     for (i, &time) in times.iter().enumerate() {
         let a = g1.row(i).unwrap();
         let z = g2.row(i).unwrap();
@@ -475,7 +484,7 @@ fn continental_chord_matches_independent_station_geometry_and_exact_range_rates(
             &(a.position() + a.rotation().to_gcrf(&v3(0.0, 450e3, 600e3))),
             &(a.velocity() + a.rotation().to_gcrf(&v3(-3000.0, 6500.0, 0.0))),
         );
-        let pred = int.differential(&x, a, time).unwrap();
+        let pred = int.differential(&x, a, &b, time).unwrap();
         let (rr1, h1) =
             range_rate_partial(&r_of(&x), &v_of(&x), a.position(), a.velocity()).unwrap();
         let (rr2, h2) =
@@ -488,8 +497,8 @@ fn continental_chord_matches_independent_station_geometry_and_exact_range_rates(
             let mut xm = x;
             xp[k] += step;
             xm[k] -= step;
-            let fd = (int.differential(&xp, a, time).unwrap().difference_hz
-                - int.differential(&xm, a, time).unwrap().difference_hz)
+            let fd = (int.differential(&xp, a, &b, time).unwrap().difference_hz
+                - int.differential(&xm, a, &b, time).unwrap().difference_hz)
                 / (2.0 * step);
             assert!((fd - pred.partial[(0, k)]).abs() < 1e-7);
         }
@@ -497,15 +506,11 @@ fn continental_chord_matches_independent_station_geometry_and_exact_range_rates(
             let mut d = V3::zeros();
             d[k] = 0.01;
             let fd = (int
-                .corrected(&d)
-                .unwrap()
-                .differential(&x, a, time)
+                .differential(&x, a, &(b + d), time)
                 .unwrap()
                 .difference_hz
                 - int
-                    .corrected(&(-d))
-                    .unwrap()
-                    .differential(&x, a, time)
+                    .differential(&x, a, &(b + (-d)), time)
                     .unwrap()
                     .difference_hz)
                 / 0.02;
@@ -525,7 +530,8 @@ fn continental_chord_matches_independent_station_geometry_and_exact_range_rates(
 fn separate_problem(same_epoch: bool, local_calibration: bool) -> PassiveRfProblem<'static> {
     let (original, _) = problem(same_epoch);
     let (first, second) = polar_sites();
-    let int = Interferometer::new(first.baseline_enu_to(&second).unwrap(), 2.23e9).unwrap();
+    let remote_baseline = first.baseline_enu_to(&second).unwrap();
+    let int = Interferometer::new(2.23e9).unwrap();
     let states = original
         .config()
         .sample(
@@ -543,6 +549,7 @@ fn separate_problem(same_epoch: bool, local_calibration: bool) -> PassiveRfProbl
                 int.differential(
                     x,
                     original.data().geometry().row(i).unwrap(),
+                    &remote_baseline,
                     original.data().geometry().timestamps()[i],
                 )
                 .unwrap()
@@ -562,6 +569,7 @@ fn separate_problem(same_epoch: bool, local_calibration: bool) -> PassiveRfProbl
             baseline_sigma_m: local_calibration.then_some(v3(0.005, 0.005, 0.005)),
             differential_doppler: Some(dd),
             differential_interferometer: Some(int),
+            differential_baselines_enu_m: Some(vec![remote_baseline; states.len()]),
             differential_baseline_sigma_m: Some(v3(0.005, 0.005, 0.005)),
         },
     )
@@ -665,4 +673,8 @@ fn compare_separate_covariance<const N: usize>(local: bool) {
 fn independent_remote_calibration_filter_matches_batch_covariance() {
     compare_separate_covariance::<12>(false);
     compare_separate_covariance::<15>(true);
+}
+
+fn baseline() -> V3 {
+    v3(59.0, 3.0, 0.2)
 }

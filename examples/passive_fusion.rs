@@ -31,7 +31,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         od_prop_settings(),
         ParameterMode::StateOnly { fixed_drag: 0.02 },
     )?;
-    let interferometer = Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9)?;
+    let baseline_enu_m = v3(59.0, 3.0, 0.2);
+    let interferometer = Interferometer::new(2.23e9)?;
     let observables = vec![
         Observable::Doppler {
             carrier_hz: 2.23e9,
@@ -39,10 +40,14 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         },
         Observable::PhaseDifference {
             interferometer,
+            baseline_enu_m,
             frequency_offset_hz: 0.0,
             phase_offset_rad: 0.0,
         },
-        Observable::DifferentialDoppler { interferometer },
+        Observable::DifferentialDoppler {
+            interferometer,
+            baseline_enu_m,
+        },
         Observable::AzimuthElevation,
     ];
 
@@ -67,7 +72,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     covariance[(1, 1)] = 0.01_f64.powi(2);
     covariance[(3, 3)] = 1e-4_f64.powi(2);
     covariance[(4, 4)] = 2e-4_f64.powi(2);
-    let batch = m::joint(geometry, observables, values, vec![covariance; times.len()])?;
+    let batch = m::joint(
+        geometry,
+        observables
+            .into_iter()
+            .map(|o| o.map_baseline(|b| vec![b; times.len()]))
+            .collect(),
+        values,
+        vec![covariance; times.len()],
+    )?;
     let mut guess = initial;
     guess[0] += 30.0;
     guess[4] += 0.02;

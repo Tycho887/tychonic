@@ -33,7 +33,9 @@ For a rotating baseline, antenna 2 has \(r_2=r_1-B\) and
 rotation vector into GCRF at the observation epoch and returns the baseline
 derivative in ENU. Earth rotation is included in the velocity of antenna 2;
 using the same velocity for both antennas would introduce a modelling error.
-`Interferometer::corrected` applies an ENU calibration correction.
+Measurements supply their ENU baseline explicitly. Batch inputs contain one
+vector per measurement. RF calibration adds its constant ENU correction to each
+supplied vector; it no longer creates a corrected interferometer.
 
 For a short baseline, the approximate signal is
 
@@ -204,7 +206,8 @@ a short-baseline approximation. Independent station-geometry tests check
 the reconstructed remote position, Earth-rotation velocity, range rates and
 analytic derivatives at multiple epochs.
 
-`RfExtensions::differential_interferometer` selects a different Doppler baseline,
+`RfExtensions::differential_interferometer` selects a separate Doppler model,
+with its required `differential_baselines_enu_m` sequence,
 anchored at the same antenna 1 as local phase. If omitted, the previous shared
 phase/Doppler baseline behavior remains. `differential_baseline_sigma_m` adds
 three independent constant calibration parameters after the local correction,
@@ -219,8 +222,8 @@ For EKF use `PassiveRfEkf::new_with_calibration` and
 `[orbit, frequency offset, phase mean, OU drift, local delta B_ENU, remote delta B_ENU]`.
 The batch order omits OU drift, which remains analytically marginalized.
 Streaming `update_with_differential_baseline` accepts the separate Doppler
-interferometer and the full observation covariance. Remote calibration can
-also be enabled with a known local phase baseline, using `<12>/<13>`.
+interferometer paired with its ENU baseline vector and the full observation
+covariance. Remote calibration can also be enabled with a known local phase baseline, using `<12>/<13>`.
 
 Reproduce the paired study with:
 

@@ -6,48 +6,41 @@ use satkit::Instant;
 
 pub const SPEED_OF_LIGHT: f64 = 299_792_458.0;
 
-/// Surveyed baseline (metres, east/north/up) and nominal carrier (Hz).
+/// Nominal carrier (Hz) and phase model. Baselines belong to measurements.
 #[derive(Clone, Copy, Debug)]
 pub struct Interferometer {
-    baseline_enu: V3,
     carrier_hz: f64,
     spherical_phase: bool,
 }
 
 impl Interferometer {
-    pub fn new(baseline_enu: V3, carrier_hz: f64) -> Result<Self> {
-        if !finite(&baseline_enu)
-            || !baseline_enu.norm().is_finite()
-            || !carrier_hz.is_finite()
-            || carrier_hz <= 0.0
-        {
+    pub fn new(carrier_hz: f64) -> Result<Self> {
+        if !carrier_hz.is_finite() || carrier_hz <= 0.0 {
             return Err(KernelError::InvalidInput(
-                "baseline/carrier must be finite; carrier positive",
+                "carrier must be finite and positive",
             ));
         }
         Ok(Self {
-            baseline_enu,
             carrier_hz,
             spherical_phase: false,
         })
     }
-    pub fn baseline_enu(&self) -> &V3 {
-        &self.baseline_enu
-    }
     pub fn carrier_hz(&self) -> f64 {
         self.carrier_hz
     }
+    /// Predict Doppler and phase using this measurement's ENU baseline in metres.
     pub fn evaluate(
         &self,
         state: &V6,
         geometry: &StationGeometry,
+        baseline_enu_m: &V3,
         frequency_bias_hz: f64,
     ) -> Result<RfPrediction> {
         phase_partial(
             state,
             geometry.position(),
             geometry.velocity(),
-            &geometry.rotation().to_gcrf(&self.baseline_enu),
+            &geometry.rotation().to_gcrf(baseline_enu_m),
             self.carrier_hz,
             frequency_bias_hz,
             self.spherical_phase,
@@ -65,14 +58,16 @@ impl Interferometer {
     }
 
     /// Signed frequency difference f1 - f2 for the two antenna reference
-    /// points. Baseline is r1-r2; both sites rotate with Earth.
+    /// points. The supplied ENU baseline is r1-r2 in metres; both sites rotate
+    /// with Earth. Additional antenna motion is not modeled.
     pub fn differential(
         &self,
         state: &V6,
         geometry: &StationGeometry,
+        baseline_enu_m: &V3,
         time: Instant,
     ) -> Result<DifferentialDopplerPrediction> {
-        let baseline = geometry.rotation().to_gcrf(&self.baseline_enu);
+        let baseline = geometry.rotation().to_gcrf(baseline_enu_m);
         let omega = satkit::frametransform::qitrf2gcrf_approx(&time)
             * v3(0.0, 0.0, satkit::consts::OMEGA_EARTH);
         let mut predicted = differential_doppler_partial(
@@ -86,12 +81,22 @@ impl Interferometer {
         predicted.baseline_partial = predicted.baseline_partial * geometry.rotation().matrix();
         Ok(predicted)
     }
+}
 
-    pub fn corrected(self, correction_enu_m: &V3) -> Result<Self> {
-        let mut corrected = Self::new(self.baseline_enu + correction_enu_m, self.carrier_hz)?;
-        corrected.spherical_phase = self.spherical_phase;
-        Ok(corrected)
+pub(crate) fn validate_baseline(baseline: &V3) -> Result<()> {
+    if !finite(baseline) || !baseline.norm().is_finite() {
+        return Err(KernelError::InvalidInput("baseline must be finite"));
     }
+    Ok(())
+}
+
+pub(crate) fn validate_baselines(baselines: &[V3], measurements: usize) -> Result<()> {
+    if baselines.len() != measurements {
+        return Err(KernelError::InvalidInput(
+            "baseline and measurement lengths must match",
+        ));
+    }
+    baselines.iter().try_for_each(validate_baseline)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -115,7 +120,8 @@ pub fn differential_doppler_partial(
     omega: &V3,
     carrier_hz: f64,
 ) -> Result<DifferentialDopplerPrediction> {
-    Interferometer::new(*baseline, carrier_hz)?;
+    Interferometer::new(carrier_hz)?;
+    validate_baseline(baseline)?;
     if !finite(omega) {
         return Err(KernelError::InvalidInput("Earth rotation must be finite"));
     }
@@ -192,7 +198,8 @@ fn phase_partial(
     frequency_bias_hz: f64,
     spherical: bool,
 ) -> Result<RfPrediction> {
-    Interferometer::new(*baseline_gcrf, carrier_hz)?;
+    Interferometer::new(carrier_hz)?;
+    validate_baseline(baseline_gcrf)?;
     if !frequency_bias_hz.is_finite() {
         return Err(KernelError::InvalidInput("frequency bias must be finite"));
     }
@@ -203,38 +210,11 @@ fn phase_partial(
         station_velocity,
     )?;
     let displacement = r_of(state) - station_position;
-    let range = displacement.norm();
-    let los = displacement / range;
-    let (path, dpath, baseline_derivative) = if spherical {
-        let other = displacement + baseline_gcrf;
-        let other_range = other.norm();
-        if other_range == 0.0 {
-            return Err(KernelError::ZeroRange);
-        }
-        if !other_range.is_finite() {
-            return Err(KernelError::Numerical(
-                "antenna 2 range exceeds numeric range",
-            ));
-        }
-        let other_los = other / other_range;
-        (
-            (displacement * 2.0 + baseline_gcrf).dot(baseline_gcrf) / (range + other_range),
-            other_los - los,
-            other_los,
-        )
-    } else {
-        let path = baseline_gcrf.dot(&los);
-        (path, (baseline_gcrf - los * path) / range, los)
-    };
+    let (path, dpath, baseline_derivative) = phase_path(displacement, baseline_gcrf, spherical)?;
     let doppler_hz = -carrier_hz / SPEED_OF_LIGHT * rr + frequency_bias_hz;
     let received_hz = carrier_hz + doppler_hz;
     let k = 2.0 * PI / SPEED_OF_LIGHT;
-    let mut partial = Matrix::zeros();
-    for j in 0..6 {
-        partial[(0, j)] = -carrier_hz / SPEED_OF_LIGHT * hrr[(0, j)];
-        partial[(1, j)] =
-            k * (path * partial[(0, j)] + if j < 3 { received_hz * dpath[j] } else { 0.0 });
-    }
+    let partial = phase_jacobian(carrier_hz, received_hz, path, &dpath, &hrr);
     let phase_rad = k * received_hz * path;
     if !doppler_hz.is_finite() || !phase_rad.is_finite() || !finite(&partial) {
         return Err(KernelError::Numerical(
@@ -248,6 +228,49 @@ fn phase_partial(
         phase_frequency_bias_partial: k * path,
         phase_baseline_partial_gcrf: baseline_derivative.transpose() * (k * received_hz),
     })
+}
+
+fn phase_jacobian(
+    carrier_hz: f64,
+    received_hz: f64,
+    path: f64,
+    dpath: &V3,
+    hrr: &Matrix<f64, 1, 6>,
+) -> Matrix<f64, 2, 6> {
+    let k = 2.0 * PI / SPEED_OF_LIGHT;
+    let mut partial = Matrix::zeros();
+    for j in 0..6 {
+        partial[(0, j)] = -carrier_hz / SPEED_OF_LIGHT * hrr[(0, j)];
+        partial[(1, j)] =
+            k * (path * partial[(0, j)] + if j < 3 { received_hz * dpath[j] } else { 0.0 });
+    }
+    partial
+}
+
+fn phase_path(displacement: V3, baseline_gcrf: &V3, spherical: bool) -> Result<(f64, V3, V3)> {
+    let range = displacement.norm();
+    let los = displacement / range;
+    if spherical {
+        let other = displacement + baseline_gcrf;
+        let other_range = other.norm();
+        if other_range == 0.0 {
+            return Err(KernelError::ZeroRange);
+        }
+        if !other_range.is_finite() {
+            return Err(KernelError::Numerical(
+                "antenna 2 range exceeds numeric range",
+            ));
+        }
+        let other_los = other / other_range;
+        Ok((
+            (displacement * 2.0 + baseline_gcrf).dot(baseline_gcrf) / (range + other_range),
+            other_los - los,
+            other_los,
+        ))
+    } else {
+        let path = baseline_gcrf.dot(&los);
+        Ok((path, (baseline_gcrf - los * path) / range, los))
+    }
 }
 
 /// Zero-mean stationary OU drift around a separately estimated hardware mean.

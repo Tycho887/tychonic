@@ -1,6 +1,20 @@
 # Changelog
 
-## 0.9.6 (Unreleased)
+## 0.9.7 (Unreleased)
+
+- **Breaking:** move surveyed baselines out of `Interferometer`; construction now
+  takes only the nominal carrier frequency. Phase-difference and differential
+  Doppler measurements require explicit ENU baselines, with one vector per
+  measurement in batch inputs. Fixed baselines use repeated vectors.
+- Carry per-measurement baselines through joint observations, batch sensitivity
+  mappings, RF fitting, and chronologically sorted streaming updates.
+- Keep shared constant ENU calibration corrections, applied to every supplied
+  baseline vector, and independent corrections for separate differential streams.
+- Update examples, tools, and [migration guidance](docs/migration_0_9_7.md).
+- Verify varying baselines, duplicate and unsorted epochs, analytic derivatives,
+  zero/reversed baselines, invalid inputs, and retained fixed-baseline behavior.
+
+## 0.9.6
 
 - Consolidate the 0.9.4 absolute calibrated covariance APIs and 0.9.5 behavioral
   antenna/receiver kernels in the canonical upstream checkout.

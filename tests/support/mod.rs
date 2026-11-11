@@ -71,6 +71,7 @@ pub fn copy_data_owned(
     tychonic::optim::PassiveRfData::new(
         PreparedGeometry::new(value.geometry().timestamps(), value.geometry().stations()).unwrap(),
         value.interferometer(),
+        value.baselines_enu_m().to_vec(),
         value.doppler_hz().to_vec(),
         value.phase_rad().map(<[f64]>::to_vec),
         value.sigma_doppler_hz(),
@@ -95,6 +96,10 @@ pub fn copy_extensions(value: &tychonic::optim::RfExtensions) -> tychonic::optim
             }
         }),
         differential_interferometer: value.differential_interferometer,
+        differential_baselines_enu_m: value
+            .differential_baselines_enu_m
+            .as_ref()
+            .map(|b| b.to_vec()),
         differential_baseline_sigma_m: value.differential_baseline_sigma_m,
     }
 }

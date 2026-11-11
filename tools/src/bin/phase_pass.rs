@@ -185,7 +185,8 @@ fn main() -> AnyResult<()> {
         ..LmSettings::default()
     };
     let ou = OuPhaseNoise::new(o.tau_hours * 3600.0, o.drift_deg.to_radians())?;
-    let interferometer = Interferometer::new(v3(o.baseline_m, 0.0, 0.0), o.carrier_hz)?;
+    let baseline_enu_m = v3(o.baseline_m, 0.0, 0.0);
+    let interferometer = Interferometer::new(o.carrier_hz)?;
     let tle = TLE::load_2line(
         "1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9009",
         "2 25544  51.6432 351.4697 0007417 130.5364 329.6482 15.48915330299350",
@@ -345,7 +346,12 @@ fn main() -> AnyResult<()> {
         let zp: Vec<_> = (0..n).map(|_| rng.normal()).collect();
         let predictions: Vec<_> = (0..n)
             .map(|i| {
-                interferometer.evaluate(&truth[i], geometry.row(i).unwrap(), true_frequency_bias)
+                interferometer.evaluate(
+                    &truth[i],
+                    geometry.row(i).unwrap(),
+                    &baseline_enu_m,
+                    true_frequency_bias,
+                )
             })
             .collect::<Result<_>>()?;
         for level in [0.0_f64, 0.1, 1.0, 5.0, 10.0] {
@@ -357,6 +363,7 @@ fn main() -> AnyResult<()> {
             let data = PassiveRfData::new(
                 &geometry,
                 interferometer,
+                vec![baseline_enu_m; times.len()],
                 (0..n)
                     .map(|i| predictions[i].doppler_hz + sigma_f * zf[i])
                     .collect(),

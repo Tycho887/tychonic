@@ -5,13 +5,13 @@ Passive orbit determination in Rust using **satkit** for astrodynamics and
 observables and analytic state derivatives, fits batches, and updates an orbit
 as new measurements arrive.
 
-Version **0.9.6** accepts extracted Doppler, phase difference, differential
+Version **0.9.7** accepts extracted Doppler, phase difference, differential
 Doppler, and azimuth/elevation. Each calibrated observable works independently,
 and any combination can be fused with full covariance. Fitting requires an
 initial orbit guess; initialization without one is future work. IQ processing,
 phase unwrapping, and cycle-slip detection belong upstream.
 
-The local source is prepared for **0.9.6**; publication is pending. It includes
+The local source is prepared for **0.9.7**; publication is pending. It includes
 the absolute calibrated covariance APIs from 0.9.4 and the behavioral antenna
 and receiver kernels from 0.9.5. See the [simulation guide](docs/simulation.md)
 for the caller-clocked plant interface.
@@ -22,7 +22,7 @@ Add tychonic from [crates.io](https://crates.io/crates/tychonic):
 
 ```toml
 [dependencies]
-tychonic = "0.9.6"
+tychonic = "0.9.7"
 ```
 
 See the [API documentation](https://docs.rs/tychonic) for available types and
@@ -80,11 +80,12 @@ use tychonic::{kernels::{GroundStation, Interferometer, PreparedGeometry, v3},
 let times = vec![Instant::from_unixtime(1704110400.25)];
 let stations = vec![GroundStation { lat_deg: 40.0, lon_deg: -75.0, alt_m: 100.0 }];
 let geometry = PreparedGeometry::new(&times, &stations)?;
-let baseline = Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9)?;
+let interferometer = Interferometer::new(2.23e9)?;
+let baseline = v3(59.0, 3.0, 0.2);
 
 let doppler = m::doppler(&geometry, 2.23e9, vec![-12500.0], 0.5)?;
-let phase = m::phase_difference(&geometry, baseline, vec![12.4], 0.01)?;
-let differential = m::differential_doppler(&geometry, baseline, vec![0.03], 0.7)?;
+let phase = m::phase_difference(&geometry, interferometer, vec![baseline], vec![12.4], 0.01)?;
+let differential = m::differential_doppler(&geometry, interferometer, vec![baseline], vec![0.03], 0.7)?;
 let angles = m::azimuth_elevation(&geometry, vec![1.2], vec![0.7], 1e-4, 2e-4)?;
 # Ok(()) }
 ```
@@ -182,7 +183,12 @@ solution and does not search across passes or fit other orbital elements.
 phase-offset priors plus an explicit `OuPhaseNoise` model. Use `build()` for the
 advanced batch problem, `fit()` or `fit_with_options()` for fitting, and
 `filter::<9>()` / `filter::<10>()` for streaming without / with estimated drag.
-Optional baseline calibration adds three states per baseline.
+Phase and differential Doppler batches require one ENU baseline vector per
+measurement. Repeat a vector for a fixed baseline; supply different vectors for
+varying geometry. See [the 0.9.7 migration guide](docs/migration_0_9_7.md).
+
+Optional baseline calibration adds three states per baseline stream, with one
+constant ENU correction added to every supplied vector.
 
 This path retains the existing Doppler, Doppler/phase, and
 Doppler/phase/differential combinations. Angle fusion with unknown RF drift

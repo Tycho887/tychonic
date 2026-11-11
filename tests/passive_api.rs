@@ -56,7 +56,7 @@ fn initial() -> V6 {
     )
 }
 fn interferometer() -> Interferometer {
-    Interferometer::new(v3(59.0, 3.0, 0.2), 2.23e9).unwrap()
+    Interferometer::new(2.23e9).unwrap()
 }
 fn selection(mask: u8) -> Vec<Observable> {
     let all = [
@@ -66,17 +66,25 @@ fn selection(mask: u8) -> Vec<Observable> {
         },
         Observable::PhaseDifference {
             interferometer: interferometer(),
+            baseline_enu_m: baseline(),
             frequency_offset_hz: 0.0,
             phase_offset_rad: 0.0,
         },
         Observable::DifferentialDoppler {
             interferometer: interferometer(),
+            baseline_enu_m: baseline(),
         },
         Observable::AzimuthElevation,
     ];
     all.into_iter()
         .enumerate()
         .filter_map(|(i, o)| (mask & (1 << i) != 0).then_some(o))
+        .collect()
+}
+fn batch_selection(mask: u8, measurements: usize) -> Vec<Observable<Vec<V3>>> {
+    selection(mask)
+        .into_iter()
+        .map(|o| o.map_baseline(|b| vec![b; measurements]))
         .collect()
 }
 fn values(mask: u8, state: &V6, g: &StationGeometry, time: Instant) -> Vec<f64> {
@@ -90,12 +98,17 @@ fn values(mask: u8, state: &V6, g: &StationGeometry, time: Instant) -> Vec<f64> 
         );
     }
     if mask & 2 != 0 {
-        z.push(interferometer().evaluate(state, g, 0.0).unwrap().phase_rad);
+        z.push(
+            interferometer()
+                .evaluate(state, g, &baseline(), 0.0)
+                .unwrap()
+                .phase_rad,
+        );
     }
     if mask & 4 != 0 {
         z.push(
             interferometer()
-                .differential(state, g, time)
+                .differential(state, g, &baseline(), time)
                 .unwrap()
                 .difference_hz,
         );
@@ -140,7 +153,7 @@ fn batch(mask: u8, seconds: &[f64], drag: bool) -> (PreparedBatch<'static>, DynV
         .collect();
     let covariances = vec![noise(mask); g.len()];
     // Selection order is deliberately reversed; values retain canonical order.
-    let mut observables = selection(mask);
+    let mut observables = batch_selection(mask, g.len());
     observables.reverse();
     (joint(g, observables, z, covariances).unwrap(), x)
 }
@@ -239,8 +252,22 @@ fn named_batches_and_sensors_support_independent_observables() {
     let z = values(15, &initial(), g.row(0).unwrap(), epoch());
     let batches = [
         doppler(&g, 2.23e9, vec![z[0]], 0.5).unwrap(),
-        phase_difference(&g, interferometer(), vec![z[1]], 0.01).unwrap(),
-        differential_doppler(&g, interferometer(), vec![z[2]], 0.7).unwrap(),
+        phase_difference(
+            &g,
+            interferometer(),
+            vec![baseline(); g.len()],
+            vec![z[1]],
+            0.01,
+        )
+        .unwrap(),
+        differential_doppler(
+            &g,
+            interferometer(),
+            vec![baseline(); g.len()],
+            vec![z[2]],
+            0.7,
+        )
+        .unwrap(),
         azimuth_elevation(&g, vec![z[3]], vec![z[4]], 1e-4, 2e-4).unwrap(),
     ];
     for b in &batches {
@@ -253,8 +280,9 @@ fn named_batches_and_sensors_support_independent_observables() {
     }
     let sensors = [
         doppler_sensor(g.row(0).unwrap(), epoch(), 2.23e9).unwrap(),
-        phase_difference_sensor(g.row(0).unwrap(), epoch(), interferometer()).unwrap(),
-        differential_doppler_sensor(g.row(0).unwrap(), epoch(), interferometer()).unwrap(),
+        phase_difference_sensor(g.row(0).unwrap(), epoch(), interferometer(), baseline()).unwrap(),
+        differential_doppler_sensor(g.row(0).unwrap(), epoch(), interferometer(), baseline())
+            .unwrap(),
     ];
     for (i, s) in sensors.iter().enumerate() {
         close(s.evaluate(&initial()).unwrap().0[0], z[i], 0.0, 0.0);
@@ -266,7 +294,16 @@ fn named_batches_and_sensors_support_independent_observables() {
         .0;
     assert_eq!(angles.as_slice(), &z[3..]);
     assert!(PreparedBatch::doppler(&g, 2.23e9, vec![z[0]], 0.5).is_ok());
-    assert!(PreparedBatch::differential_doppler(g, interferometer(), vec![z[2]], 0.7).is_ok());
+    assert!(
+        PreparedBatch::differential_doppler(
+            &g,
+            interferometer(),
+            vec![baseline(); g.len()],
+            vec![z[2]],
+            0.7
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -371,14 +408,17 @@ fn angular_wrapping_validation_and_offset_calibration() {
     let g = b.geometry();
     let mut z = values(15, &initial(), g.row(0).unwrap(), epoch());
     z[3] += TAU;
-    let wrapped = joint(g, selection(15), vec![z], vec![noise(15)]).unwrap();
+    let wrapped = joint(g, batch_selection(15, g.len()), vec![z], vec![noise(15)]).unwrap();
     assert!(wrapped.evaluate(&x, &config(false)).unwrap().rss() < 1e-20);
     assert!(joint(g, vec![], vec![vec![]], vec![DynMatrix::zeros(0, 0)]).is_err());
     assert!(joint_sensor::<2>(g.row(0).unwrap(), epoch(), selection(1)).is_err());
     assert!(
         joint(
             g,
-            vec![selection(1)[0]; 2],
+            vec![selection(1)[0]; 2]
+                .into_iter()
+                .map(|o| o.map_baseline(|b| vec![b; g.len()]))
+                .collect(),
             vec![vec![0.0; 2]],
             vec![noise(5)]
         )
@@ -389,14 +429,16 @@ fn angular_wrapping_validation_and_offset_calibration() {
         DynMatrix::from_fn(1, 1, |_, _| f64::NAN),
         DynMatrix::zeros(2, 2),
     ] {
-        assert!(joint(g, selection(1), vec![vec![0.0]], vec![r]).is_err());
+        assert!(joint(g, batch_selection(1, g.len()), vec![vec![0.0]], vec![r]).is_err());
     }
     let mut r = noise(5);
     r[(0, 1)] += 0.1;
-    assert!(joint(g, selection(5), vec![vec![0.0; 2]], vec![r]).is_err());
+    assert!(joint(g, batch_selection(5, g.len()), vec![vec![0.0; 2]], vec![r]).is_err());
     assert!(doppler(g, -1.0, vec![0.0], 1.0).is_err());
     assert!(doppler(g, 1.0, vec![0.0], 1e-300).is_err());
-    assert!(differential_doppler(g, interferometer(), vec![], 1.0).is_err());
+    assert!(
+        differential_doppler(g, interferometer(), vec![baseline(); g.len()], vec![], 1.0).is_err()
+    );
     assert!(b.joint_observation::<5>(1).is_err());
     let offsets = vec![
         Observable::Doppler {
@@ -405,6 +447,7 @@ fn angular_wrapping_validation_and_offset_calibration() {
         },
         Observable::PhaseDifference {
             interferometer: interferometer(),
+            baseline_enu_m: baseline(),
             frequency_offset_hz: 12.0,
             phase_offset_rad: 0.4,
         },
@@ -420,7 +463,7 @@ fn angular_wrapping_validation_and_offset_calibration() {
     close(
         z[1],
         interferometer()
-            .evaluate(&initial(), g.row(0).unwrap(), 12.0)
+            .evaluate(&initial(), g.row(0).unwrap(), &baseline(), 12.0)
             .unwrap()
             .phase_rad
             + 0.4,
@@ -466,10 +509,11 @@ fn named_rf_priors_match_advanced_batch_and_filter_setup() {
     let data = PassiveRfData::new(
         &g,
         interferometer(),
+        vec![baseline(); g.len()],
         (0..g.len())
             .map(|i| {
                 interferometer()
-                    .evaluate(&s.states()[i], g.row(i).unwrap(), 3.0)
+                    .evaluate(&s.states()[i], g.row(i).unwrap(), &baseline(), 3.0)
                     .unwrap()
                     .doppler_hz
             })
@@ -478,7 +522,7 @@ fn named_rf_priors_match_advanced_batch_and_filter_setup() {
             (0..g.len())
                 .map(|i| {
                     interferometer()
-                        .evaluate(&s.states()[i], g.row(i).unwrap(), 3.0)
+                        .evaluate(&s.states()[i], g.row(i).unwrap(), &baseline(), 3.0)
                         .unwrap()
                         .phase_rad
                         + 0.2
@@ -539,4 +583,8 @@ fn named_rf_priors_match_advanced_batch_and_filter_setup() {
             .filter::<12>()
             .is_ok()
     );
+}
+
+fn baseline() -> V3 {
+    v3(59.0, 3.0, 0.2)
 }

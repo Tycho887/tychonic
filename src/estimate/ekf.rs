@@ -132,10 +132,13 @@ impl<const M: usize> MeasurementModel<M> for GroundSensor<'_, M> {
 pub struct PhaseSensor<'g> {
     pub geometry: StationGeometrySource<'g>,
     pub interferometer: Interferometer,
+    pub baseline_enu_m: V3,
 }
 impl MeasurementModel<1> for PhaseSensor<'_> {
     fn evaluate(&self, state: &V6) -> crate::kernels::Result<(Vector<f64, 1>, Matrix<f64, 1, 6>)> {
-        let pred = self.interferometer.evaluate(state, &self.geometry, 0.0)?;
+        let pred =
+            self.interferometer
+                .evaluate(state, &self.geometry, &self.baseline_enu_m, 0.0)?;
         let mut h = Matrix::zeros();
         for k in 0..6 {
             h[(0, k)] = pred.partial[(1, k)];
@@ -459,6 +462,9 @@ impl<const N: usize> OrbitEkf<N> {
             value: Vector::from_array([column[row]]),
             covariance: Matrix::new([[sigma * sigma]]),
             model: PhaseSensor {
+                baseline_enu_m: batch
+                    .baselines_enu_m()
+                    .ok_or(KernelError::InvalidInput("phase baselines"))?[row],
                 geometry: batch
                     .geometry()
                     .row(row)

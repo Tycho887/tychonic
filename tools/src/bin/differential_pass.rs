@@ -173,14 +173,12 @@ fn main() -> AnyResult<()> {
     let baseline = source["baseline_enu_m"]
         .as_array()
         .ok_or("missing baseline")?;
-    let source_int = Interferometer::new(
-        v3(
-            baseline[0].as_f64().ok_or("baseline E")?,
-            baseline[1].as_f64().ok_or("baseline N")?,
-            baseline[2].as_f64().ok_or("baseline U")?,
-        ),
-        carrier,
-    )?;
+    let baseline_enu_m = v3(
+        baseline[0].as_f64().ok_or("baseline E")?,
+        baseline[1].as_f64().ok_or("baseline N")?,
+        baseline[2].as_f64().ok_or("baseline U")?,
+    );
+    let source_int = Interferometer::new(carrier)?;
     let int = source_int.with_spherical_phase();
     let ou = OuPhaseNoise::new(
         config_number(&source, "tau_hours")? * 3600.0,
@@ -225,16 +223,14 @@ fn main() -> AnyResult<()> {
         lon_deg: config_number(&source, "station_lon_deg")?,
         alt_m: config_number(&source, "station_alt_m")?,
     };
-    let differential_int = if scenario == "tromso-svalbard" {
-        Some(Interferometer::new(
-            site.baseline_enu_to(&regional_pass::SVALBARD)?,
-            carrier,
-        )?)
+    let differential_baseline = if scenario == "tromso-svalbard" {
+        Some(site.baseline_enu_to(&regional_pass::SVALBARD)?)
     } else {
         None
     };
+    let differential_int = differential_baseline.map(|_| int);
     let differential_sigma = differential_int.and(sigma);
-    let nominal_differential_int = differential_int.unwrap_or(int);
+    let nominal_differential_baseline = differential_baseline.unwrap_or(baseline_enu_m);
     let geometry = PreparedGeometry::new(&times, &vec![site; times.len()])?;
     let mut priors = BTreeMap::<usize, (DynVector<f64>, DynVector<f64>)>::new();
     for r in rows(&input.join("priors.csv"))? {
@@ -278,9 +274,9 @@ fn main() -> AnyResult<()> {
         "differential_sign":"f1-f2","receiver_frequency_offsets":"common and cancelling; differential offset calibrated",
         "phase_and_frequency_noise":"independent estimates; phase OU not differentiated",
             "phase_path_model":"spherical, rationalized exact range difference",
-        "scenario":scenario,"phase_baseline_enu_m":int.baseline_enu().as_slice(),
-        "differential_baseline_enu_m":nominal_differential_int.baseline_enu().as_slice(),
-        "differential_baseline_length_m":nominal_differential_int.baseline_enu().norm(),
+        "scenario":scenario,"phase_baseline_enu_m":baseline_enu_m.as_slice(),
+        "differential_baseline_enu_m":nominal_differential_baseline.as_slice(),
+        "differential_baseline_length_m":nominal_differential_baseline.norm(),
         "differential_baseline_sigma_mm_per_component":if differential_int.is_some() { baseline_mm } else { 0.0 },
         "baseline_calibration":"constant ENU vector errors; independent local phase and remote Doppler corrections when separate",
         "differential_station":if differential_int.is_some() {source["remote_station"].clone()} else {Value::Null},
@@ -321,7 +317,7 @@ fn main() -> AnyResult<()> {
         } else {
             V3::zeros()
         };
-        let truth_int = int.corrected(&btrue)?;
+        let truth_baseline = baseline_enu_m + btrue;
         let second_noise: Vec<_> = (0..times.len()).map(|_| sigma2 * rng.normal()).collect();
         let mut remote_rng = Random(seed ^ 0x96aa_108f_741a_33e9);
         let remote_error = differential_sigma.map_or(V3::zeros(), |s| {
@@ -331,11 +327,8 @@ fn main() -> AnyResult<()> {
                 s[2] * remote_rng.normal(),
             )
         });
-        let truth_differential_int = if let Some(remote) = differential_int {
-            remote.corrected(&remote_error)?
-        } else {
-            truth_int
-        };
+        let truth_differential_baseline =
+            differential_baseline.map_or(truth_baseline, |b| b + remote_error);
         for level in [0.1_f64, 1.0, 5.0, 10.0] {
             let source_rows = groups
                 .get(&(trial, (level * 10.0).round() as i32))
@@ -353,11 +346,11 @@ fn main() -> AnyResult<()> {
                 }
                 let bias = number(&source_rows[i], 6)?;
                 let row = geometry.row(i).unwrap();
-                let nominal = source_int.evaluate(&truth[i], row, bias)?;
-                let actual = truth_int.evaluate(&truth[i], row, bias)?;
+                let nominal = source_int.evaluate(&truth[i], row, &baseline_enu_m, bias)?;
+                let actual = int.evaluate(&truth[i], row, &truth_baseline, bias)?;
                 let first_noise = (number(&source_rows[i], 4)? - nominal.doppler_hz) * noise_scale;
-                let dtrue = truth_differential_int
-                    .differential(&truth[i], row, times[i])?
+                let dtrue = int
+                    .differential(&truth[i], row, &truth_differential_baseline, times[i])?
                     .difference_hz;
                 let observed = actual.doppler_hz + first_noise;
                 let d = dtrue + first_noise - second_noise[i];
@@ -392,6 +385,7 @@ fn main() -> AnyResult<()> {
                 let data = PassiveRfData::new(
                     &geometry,
                     int,
+                    vec![baseline_enu_m; times.len()],
                     if case == "averaging_control" {
                         averaging.clone()
                     } else {
@@ -413,6 +407,8 @@ fn main() -> AnyResult<()> {
                     baseline_sigma_m: sigma,
                     differential_doppler: dd,
                     differential_interferometer: differential_int,
+                    differential_baselines_enu_m: differential_baseline
+                        .map(|b| vec![b; times.len()]),
                     differential_baseline_sigma_m: differential_sigma,
                 };
                 let problem = PassiveRfProblem::new_extended(

@@ -13,6 +13,7 @@ use numeris::{
 pub struct PassiveRfData<'g> {
     pub(crate) geometry: GeometrySource<'g>,
     pub(crate) interferometer: Interferometer,
+    pub(crate) baselines_enu_m: Vec<V3>,
     pub(crate) doppler_hz: Vec<f64>,
     pub(crate) phase_rad: Option<Vec<f64>>,
     pub(crate) sigma_doppler_hz: f64,
@@ -23,6 +24,7 @@ impl<'g> PassiveRfData<'g> {
     pub fn new(
         geometry: impl Into<GeometrySource<'g>>,
         interferometer: Interferometer,
+        baselines_enu_m: Vec<V3>,
         doppler_hz: Vec<f64>,
         phase_rad: Option<Vec<f64>>,
         sigma_doppler_hz: f64,
@@ -31,6 +33,7 @@ impl<'g> PassiveRfData<'g> {
         let data = Self {
             geometry: geometry.into(),
             interferometer,
+            baselines_enu_m,
             doppler_hz,
             phase_rad,
             sigma_doppler_hz,
@@ -44,6 +47,10 @@ impl<'g> PassiveRfData<'g> {
     }
     pub fn interferometer(&self) -> Interferometer {
         self.interferometer
+    }
+    /// Antenna 1 minus antenna 2 in antenna 1's ENU frame, per measurement.
+    pub fn baselines_enu_m(&self) -> &[V3] {
+        &self.baselines_enu_m
     }
     pub fn doppler_hz(&self) -> &[f64] {
         &self.doppler_hz
@@ -60,6 +67,7 @@ impl<'g> PassiveRfData<'g> {
 
     pub fn validate(&self) -> Result<()> {
         let n = self.geometry.len();
+        validate_baselines(&self.baselines_enu_m, n)?;
         if n == 0
             || self.doppler_hz.len() != n
             || self
@@ -162,6 +170,8 @@ pub struct RfExtensions {
     /// Separate Doppler baseline anchored at the same antenna 1 as phase.
     /// None uses the phase baseline, including its calibration correction.
     pub differential_interferometer: Option<Interferometer>,
+    /// Required with a separate differential interferometer, in measurement order.
+    pub differential_baselines_enu_m: Option<Vec<V3>>,
     /// Independent constant ENU calibration of the separate Doppler baseline.
     pub differential_baseline_sigma_m: Option<V3>,
 }
@@ -177,15 +187,23 @@ pub(crate) fn validate_baseline_sigma(sigma: &V3) -> Result<()> {
     Ok(())
 }
 
-/// Shared input validation without constructing the dense batch covariance.
-pub(crate) fn validate_rf_setup(
-    config: &PropagationConfig,
-    data: &PassiveRfData,
-    prior: &RfPrior,
+pub(crate) fn validate_differential_baselines(
     extensions: &RfExtensions,
+    measurements: usize,
 ) -> Result<()> {
-    data.validate()?;
-    prior.validate(config.mode().columns() + 2)?;
+    match (
+        &extensions.differential_interferometer,
+        &extensions.differential_baselines_enu_m,
+    ) {
+        (Some(_), Some(baselines)) => validate_baselines(baselines, measurements),
+        (None, None) => Ok(()),
+        _ => Err(KernelError::InvalidInput(
+            "separate differential interferometer requires baselines",
+        )),
+    }
+}
+
+fn validate_baseline_calibration(extensions: &RfExtensions) -> Result<()> {
     if let Some(sigma) = &extensions.baseline_sigma_m {
         validate_baseline_sigma(sigma)?;
     }
@@ -197,6 +215,20 @@ pub(crate) fn validate_rf_setup(
             ));
         }
     }
+    Ok(())
+}
+
+/// Shared input validation without constructing the dense batch covariance.
+pub(crate) fn validate_rf_setup(
+    config: &PropagationConfig,
+    data: &PassiveRfData,
+    prior: &RfPrior,
+    extensions: &RfExtensions,
+) -> Result<()> {
+    data.validate()?;
+    validate_differential_baselines(extensions, data.geometry.len())?;
+    prior.validate(config.mode().columns() + 2)?;
+    validate_baseline_calibration(extensions)?;
     if extensions
         .differential_interferometer
         .is_some_and(|int| int.carrier_hz() != data.interferometer.carrier_hz())
@@ -284,15 +316,13 @@ impl<'g> PassiveRfProblem<'g> {
     pub fn measurement_covariance(&self) -> Result<DynMatrix<f64>> {
         rf_covariance(&self.data, &self.extensions, self.ou)
     }
-    fn interferometer_at(&self, x: &DynVector<f64>) -> Result<Interferometer> {
-        let p = self.config.mode().columns();
+    fn baseline_at(&self, x: &DynVector<f64>, row: usize) -> V3 {
+        let mut baseline = self.data.baselines_enu_m[row];
         if self.extensions.baseline_sigma_m.is_some() {
-            self.data
-                .interferometer
-                .corrected(&v3(x[p + 2], x[p + 3], x[p + 4]))
-        } else {
-            Ok(self.data.interferometer)
+            let p = self.config.mode().columns();
+            baseline += v3(x[p + 2], x[p + 3], x[p + 4]);
         }
+        baseline
     }
     pub fn evaluate(&self, x: &DynVector<f64>) -> Result<Evaluation> {
         let mut output = Evaluation::default();
@@ -315,8 +345,7 @@ impl<'g> PassiveRfProblem<'g> {
         )?;
         e.residual.as_mut_slice().fill(0.0);
         e.jacobian.as_mut_slice().fill(0.0);
-        let interferometer = self.interferometer_at(x)?;
-        let differential = self.differential_at(x, interferometer)?;
+        let interferometer = self.data.interferometer;
         for ((i, geometry), sample) in self
             .data
             .geometry
@@ -324,10 +353,12 @@ impl<'g> PassiveRfProblem<'g> {
             .enumerate()
             .zip(sens.iter_rows())
         {
-            let pred = interferometer.evaluate(sample.state, geometry, x[p])?;
+            let baseline = self.baseline_at(x, i);
+            let pred = interferometer.evaluate(sample.state, geometry, &baseline, x[p])?;
+            let differential = self.differential_at(x, i, baseline);
             self.write_doppler(i, &sample, &pred, e);
             self.write_phase(i, x, &sample, geometry, &pred, e);
-            self.write_differential(i, &sample, geometry, differential, e)?;
+            self.write_differential(i, &sample, geometry, differential.0, &differential.1, e)?;
         }
         whiten(e, self.measurement_factor.l(), rows, columns);
         self.write_priors(x, e, rows);
@@ -339,13 +370,21 @@ impl<'g> PassiveRfProblem<'g> {
         }
         Ok(())
     }
-    fn differential_at(&self, x: &DynVector<f64>, local: Interferometer) -> Result<Interferometer> {
-        let mut interferometer = self.extensions.differential_interferometer.unwrap_or(local);
+    fn differential_at(&self, x: &DynVector<f64>, row: usize, local: V3) -> (Interferometer, V3) {
+        let interferometer = self
+            .extensions
+            .differential_interferometer
+            .unwrap_or(self.data.interferometer);
+        let mut baseline = self
+            .extensions
+            .differential_baselines_enu_m
+            .as_ref()
+            .map_or(local, |baselines| baselines[row]);
         if self.extensions.differential_baseline_sigma_m.is_some() {
             let k = self.differential_baseline_column();
-            interferometer = interferometer.corrected(&v3(x[k], x[k + 1], x[k + 2]))?;
+            baseline += v3(x[k], x[k + 1], x[k + 2]);
         }
-        Ok(interferometer)
+        (interferometer, baseline)
     }
     fn write_doppler(
         &self,
@@ -412,13 +451,14 @@ impl<'g> PassiveRfProblem<'g> {
         sample: &SensitivityRow<'_>,
         geometry: &StationGeometry,
         interferometer: Interferometer,
+        baseline: &V3,
         e: &mut Evaluation,
     ) -> Result<()> {
         let Some(observed) = &self.extensions.differential_doppler else {
             return Ok(());
         };
         let row = 2 * self.data.geometry.len() + i;
-        let pred = interferometer.differential(sample.state, geometry, sample.time)?;
+        let pred = interferometer.differential(sample.state, geometry, baseline, sample.time)?;
         let h = pred.partial * sample.stm;
         for k in 0..6 {
             e.jacobian[(row, k)] = h[(0, k)];
@@ -468,10 +508,15 @@ impl<'g> PassiveRfProblem<'g> {
         let sens = self
             .config
             .sample(&DynVector::from_slice(&x.as_slice()[..p]), times)?;
-        let interferometer = self.interferometer_at(x)?;
+        let interferometer = self.data.interferometer;
         let mut residual = DynVector::zeros(times.len());
         for (i, geometry) in self.data.geometry.iter_rows().enumerate() {
-            let pred = interferometer.evaluate(&sens.states[i], geometry, x[p])?;
+            let pred = interferometer.evaluate(
+                &sens.states[i],
+                geometry,
+                &self.baseline_at(x, i),
+                x[p],
+            )?;
             residual[i] = observed[i] - pred.phase_rad - x[p + 1];
         }
         let c = self.ou.covariance(times, self.data.sigma_phase_rad)?;

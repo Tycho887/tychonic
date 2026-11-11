@@ -8,8 +8,10 @@ corresponding phase/path-length relation. Supplied PDFs remain locally in ignore
 [model citations](../references/README.md) for publisher links.
 
 Define the surveyed baseline as **antenna 1 minus antenna 2**, expressed in
-antenna 1's east/north/up frame in metres. `Interferometer::new` accepts this
-vector and the nominal carrier frequency in Hz. The prepared station rotation
+antenna 1's east/north/up frame in metres. `Interferometer::new(carrier_hz)`
+sets the nominal carrier frequency. Measurements supply their baseline explicitly;
+batches require one vector per measurement, including repeated vectors for a
+fixed baseline. The prepared station rotation
 transforms the baseline to GCRF at each observation epoch. Reversing the baseline
 reverses the geometric phase and its derivatives. Swapping the observed channel
 order therefore requires reversing the baseline and offset convention together.
@@ -50,7 +52,7 @@ local orbit refinement, without light-time or atmospheric corrections.
 
 `phase_difference_partial` returns carrier-relative Doppler and phase predictions,
 a two-row instantaneous state Jacobian, and the direct frequency-offset
-derivative of phase. `Interferometer::evaluate` prepares its GCRF baseline using
+derivative of phase. `Interferometer::evaluate` prepares the supplied ENU baseline in GCRF using
 the supplied station geometry.
 
 Using the existing range-rate partials,

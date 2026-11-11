@@ -191,6 +191,7 @@ impl<const N: usize> PassiveRfEkf<N> {
         observed: &Vector<f64, M>,
         geometry: &StationGeometry,
         interferometer: Interferometer,
+        baseline_enu_m: &V3,
         covariance: &Matrix<f64, M, M>,
         options: UpdateOptions,
     ) -> EkfResult<UpdateResult<M>> {
@@ -198,6 +199,7 @@ impl<const N: usize> PassiveRfEkf<N> {
             observed,
             geometry,
             interferometer,
+            baseline_enu_m,
             None,
             covariance,
             options,
@@ -205,21 +207,19 @@ impl<const N: usize> PassiveRfEkf<N> {
     }
     /// As update, with an optional separate Doppler baseline anchored at the
     /// same antenna 1. Its calibration states are independent of local phase.
+    // The public update keeps measurement geometry and calibration inputs explicit.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_with_differential_baseline<const M: usize>(
         &mut self,
         observed: &Vector<f64, M>,
         geometry: &StationGeometry,
         interferometer: Interferometer,
-        differential_interferometer: Option<Interferometer>,
+        baseline_enu_m: &V3,
+        differential_interferometer: Option<(Interferometer, V3)>,
         covariance: &Matrix<f64, M, M>,
         options: UpdateOptions,
     ) -> EkfResult<UpdateResult<M>> {
-        if !(1..=3).contains(&M)
-            || !observed.as_slice().iter().all(|x| x.is_finite())
-            || options.gate.is_some_and(|g| !g.is_finite() || g < 0.0)
-        {
-            return Err(KernelError::InvalidInput("RF sensor dimension, reading or gate").into());
-        }
+        validate_rf_reading(observed, options)?;
         check_covariance(covariance, true)?;
         check_differential_sensor::<M>(
             interferometer,
@@ -231,6 +231,7 @@ impl<const N: usize> PassiveRfEkf<N> {
             observed,
             geometry,
             interferometer,
+            baseline_enu_m,
             differential_interferometer,
         )?;
         let mut candidate = Ekf::<f64, N, M>::new(self.filter.x, self.filter.p);
@@ -260,21 +261,25 @@ impl<const N: usize> PassiveRfEkf<N> {
         observed: &Vector<f64, M>,
         geometry: &StationGeometry,
         interferometer: Interferometer,
-        differential_interferometer: Option<Interferometer>,
+        baseline_enu_m: &V3,
+        differential_interferometer: Option<(Interferometer, V3)>,
     ) -> Result<(Vector<f64, M>, Matrix<f64, M, N>)> {
         let p = self.config.mode().columns();
-        let interferometer = if self.has_baseline {
-            interferometer.corrected(&v3(
-                self.filter.x[p + 3],
-                self.filter.x[p + 4],
-                self.filter.x[p + 5],
-            ))?
+        validate_baseline(baseline_enu_m)?;
+        let baseline = if self.has_baseline {
+            baseline_enu_m
+                + v3(
+                    self.filter.x[p + 3],
+                    self.filter.x[p + 4],
+                    self.filter.x[p + 5],
+                )
         } else {
-            interferometer
+            *baseline_enu_m
         };
         let pred = interferometer.evaluate(
             &V6::from_slice(&self.filter.x.as_slice()[..6]),
             geometry,
+            &baseline,
             self.filter.x[p],
         )?;
         let mut h = Matrix::<f64, M, N>::zeros();
@@ -288,7 +293,7 @@ impl<const N: usize> PassiveRfEkf<N> {
         self.add_differential(
             observed,
             geometry,
-            interferometer,
+            (interferometer, baseline),
             differential_interferometer,
             &mut innovation,
             &mut h,
@@ -335,14 +340,15 @@ impl<const N: usize> PassiveRfEkf<N> {
         &self,
         observed: &Vector<f64, M>,
         geometry: &StationGeometry,
-        interferometer: Interferometer,
-        differential_interferometer: Option<Interferometer>,
+        phase_geometry: (Interferometer, V3),
+        differential_interferometer: Option<(Interferometer, V3)>,
         innovation: &mut Vector<f64, M>,
         h: &mut Matrix<f64, M, N>,
     ) -> Result<()> {
         let p = self.config.mode().columns();
         if M == 3 {
-            let mut differential_int = differential_interferometer.unwrap_or(interferometer);
+            let (differential_int, mut baseline) =
+                differential_interferometer.unwrap_or(phase_geometry);
             let column = if self.has_differential_baseline {
                 Some(p + 3 + 3 * usize::from(self.has_baseline))
             } else if self.has_baseline && differential_interferometer.is_none() {
@@ -352,15 +358,12 @@ impl<const N: usize> PassiveRfEkf<N> {
             };
             if self.has_differential_baseline {
                 let k = p + 3 + 3 * usize::from(self.has_baseline);
-                differential_int = differential_int.corrected(&v3(
-                    self.filter.x[k],
-                    self.filter.x[k + 1],
-                    self.filter.x[k + 2],
-                ))?;
+                baseline += v3(self.filter.x[k], self.filter.x[k + 1], self.filter.x[k + 2]);
             }
             let pred = differential_int.differential(
                 &V6::from_slice(&self.filter.x.as_slice()[..6]),
                 geometry,
+                &baseline,
                 self.epoch,
             )?;
             innovation[2] = observed[2] - pred.difference_hz;
@@ -398,10 +401,13 @@ impl<const N: usize> PassiveRfEkf<N> {
         extensions: &RfExtensions,
         options: UpdateOptions,
     ) -> EkfResult<Vec<(f64, bool)>> {
+        crate::optim::passive_rf::validate_differential_baselines(extensions, data.geometry.len())?;
         self.filter_data_borrowed(
             data,
             extensions.differential_doppler.as_ref(),
-            extensions.differential_interferometer,
+            extensions
+                .differential_interferometer
+                .zip(extensions.differential_baselines_enu_m.as_deref()),
             options,
         )
     }
@@ -409,7 +415,7 @@ impl<const N: usize> PassiveRfEkf<N> {
         &mut self,
         data: &PassiveRfData,
         differential: Option<&DifferentialDopplerData>,
-        differential_interferometer: Option<Interferometer>,
+        differential_interferometer: Option<(Interferometer, &[V3])>,
         options: UpdateOptions,
     ) -> EkfResult<Vec<(f64, bool)>> {
         data.validate()?;
@@ -461,7 +467,7 @@ impl<const N: usize> PassiveRfEkf<N> {
         i: usize,
         data: &PassiveRfData,
         differential: Option<&DifferentialDopplerData>,
-        differential_interferometer: Option<Interferometer>,
+        differential_interferometer: Option<(Interferometer, &[V3])>,
         g: &StationGeometry,
         options: UpdateOptions,
     ) -> EkfResult<(f64, bool)> {
@@ -476,7 +482,9 @@ impl<const N: usize> PassiveRfEkf<N> {
                 ]),
                 g,
                 data.interferometer,
-                differential_interferometer,
+                &data.baselines_enu_m[i],
+                differential_interferometer
+                    .map(|(interferometer, baselines)| (interferometer, baselines[i])),
                 &dd.covariance(data),
                 options,
             )
@@ -486,6 +494,7 @@ impl<const N: usize> PassiveRfEkf<N> {
                 &Vector::from_array([data.doppler_hz[i], phase[i]]),
                 g,
                 data.interferometer,
+                &data.baselines_enu_m[i],
                 &Matrix::new([
                     [data.sigma_doppler_hz.powi(2), 0.0],
                     [0.0, data.sigma_phase_rad.powi(2)],
@@ -498,6 +507,7 @@ impl<const N: usize> PassiveRfEkf<N> {
                 &Vector::from_array([data.doppler_hz[i]]),
                 g,
                 data.interferometer,
+                &data.baselines_enu_m[i],
                 &Matrix::new([[data.sigma_doppler_hz.powi(2)]]),
                 options,
             )
@@ -533,13 +543,31 @@ fn record<const N: usize>(
     }
 }
 
+fn validate_rf_reading<const M: usize>(
+    observed: &Vector<f64, M>,
+    options: UpdateOptions,
+) -> Result<()> {
+    if !(1..=3).contains(&M)
+        || !observed.as_slice().iter().all(|x| x.is_finite())
+        || options.gate.is_some_and(|g| !g.is_finite() || g < 0.0)
+    {
+        return Err(KernelError::InvalidInput(
+            "RF sensor dimension, reading or gate",
+        ));
+    }
+    Ok(())
+}
+
 fn check_differential_sensor<const M: usize>(
     interferometer: Interferometer,
-    differential_interferometer: Option<Interferometer>,
+    differential_interferometer: Option<(Interferometer, V3)>,
     has_differential_baseline: bool,
 ) -> EkfResult<()> {
+    if let Some((_, baseline)) = &differential_interferometer {
+        validate_baseline(baseline)?;
+    }
     if differential_interferometer
-        .is_some_and(|int| int.carrier_hz() != interferometer.carrier_hz())
+        .is_some_and(|(int, _)| int.carrier_hz() != interferometer.carrier_hz())
         || (M == 3 && has_differential_baseline && differential_interferometer.is_none())
     {
         return Err(

@@ -276,6 +276,7 @@ enum BatchData {
     PhaseDifference {
         observations: [ObservationColumn; 1],
         interferometer: Interferometer,
+        baselines_enu_m: Vec<V3>,
     },
     AzimuthElevation([ObservationColumn; 2]),
     Combined([ObservationColumn; 3]),
@@ -344,10 +345,17 @@ impl<'g> PreparedBatch<'g> {
     pub fn differential_doppler(
         geometry: impl Into<GeometrySource<'g>>,
         interferometer: Interferometer,
+        baselines_enu_m: Vec<V3>,
         values_hz: Vec<f64>,
         sigma_hz: f64,
     ) -> Result<Self> {
-        crate::measurements::differential_doppler(geometry, interferometer, values_hz, sigma_hz)
+        crate::measurements::differential_doppler(
+            geometry,
+            interferometer,
+            baselines_enu_m,
+            values_hz,
+            sigma_hz,
+        )
     }
 
     /// Calibrated continuous phase (rad). Use PassiveRfProblem to estimate
@@ -355,6 +363,7 @@ impl<'g> PreparedBatch<'g> {
     pub fn phase_difference(
         geometry: impl Into<GeometrySource<'g>>,
         interferometer: Interferometer,
+        baselines_enu_m: Vec<V3>,
         values: Vec<f64>,
         sigma_rad: f64,
     ) -> Result<Self> {
@@ -367,8 +376,18 @@ impl<'g> PreparedBatch<'g> {
                     angular: false,
                 }],
                 interferometer,
+                baselines_enu_m,
             },
         )
+    }
+    /// Supplied ENU baselines in measurement order, for a legacy phase batch.
+    pub fn baselines_enu_m(&self) -> Option<&[V3]> {
+        match &self.data {
+            BatchData::PhaseDifference {
+                baselines_enu_m, ..
+            } => Some(baselines_enu_m),
+            _ => None,
+        }
     }
     pub fn interferometer(&self) -> Option<Interferometer> {
         match self.data {
@@ -470,6 +489,9 @@ impl<'g> PreparedBatch<'g> {
             .len()
             .checked_mul(batch.components())
             .ok_or(KernelError::InvalidInput("output dimensions overflow"))?;
+        if let Some(baselines) = batch.baselines_enu_m() {
+            validate_baselines(baselines, batch.geometry.len())?;
+        }
         for obs in batch.observations() {
             if obs.values.len() != batch.geometry.len() || !obs.values.iter().all(|x| x.is_finite())
             {
@@ -614,7 +636,7 @@ impl<'g> PreparedBatch<'g> {
                 stm: &sens.stm[index],
                 state_dcd: sens.state_dcd.get(index),
             };
-            let (predictions, partial) = self.predict_row::<M>(sample.state, geometry)?;
+            let (predictions, partial) = self.predict_row::<M>(sample.state, geometry, i)?;
             let chained = compose_sample::<M, P>(&partial, &sample);
             self.write_row(i, &predictions, &chained, output, offset)?;
         }
@@ -624,13 +646,21 @@ impl<'g> PreparedBatch<'g> {
         &self,
         state: &V6,
         geometry: &StationGeometry,
+        row: usize,
     ) -> Result<([f64; M], Matrix<f64, M, 6>)> {
         let r = r_of(state);
         let v = v_of(state);
         let mut predictions = [0.0; M];
         let mut partial = Matrix::<f64, M, 6>::zeros();
         if let Some(interferometer) = self.interferometer() {
-            let pred = interferometer.evaluate(state, geometry, 0.0)?;
+            let pred = interferometer.evaluate(
+                state,
+                geometry,
+                &self
+                    .baselines_enu_m()
+                    .ok_or(KernelError::InvalidInput("phase baselines"))?[row],
+                0.0,
+            )?;
             predictions[0] = pred.phase_rad;
             for k in 0..6 {
                 partial[(0, k)] = pred.partial[(1, k)];

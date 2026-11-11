@@ -65,7 +65,8 @@ pub fn generate(path: &Path, trials: usize) -> AnyResult<()> {
     let truth: Vec<_> = selected.iter().map(|&i| states[i]).collect();
     let epoch = times[0];
     let geometry = PreparedGeometry::new(&times, &vec![TROMSO; times.len()])?;
-    let int = Interferometer::new(v3(59.0, 0.0, 0.0), 2.23e9)?;
+    let baseline_enu_m = v3(59.0, 0.0, 0.0);
+    let int = Interferometer::new(2.23e9)?;
     let ou = OuPhaseNoise::new(21600.0, 5_f64.to_radians())?;
     fs::create_dir_all(path)?;
     let source = json!({
@@ -141,7 +142,8 @@ pub fn generate(path: &Path, trials: usize) -> AnyResult<()> {
         let zp: Vec<_> = (0..n).map(|_| rng.normal()).collect();
         for level in [0.1_f64, 1.0, 5.0, 10.0] {
             for i in 0..n {
-                let pred = int.evaluate(&truth[i], geometry.row(i).unwrap(), bias)?;
+                let pred =
+                    int.evaluate(&truth[i], geometry.row(i).unwrap(), &baseline_enu_m, bias)?;
                 writeln!(
                     observations,
                     "{trial},{seed},{level},{},{:.16e},{:.16e},{bias:.16e},{mean:.16e},{:.16e}",

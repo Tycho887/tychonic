@@ -73,14 +73,21 @@ impl<'g> RfBuilder<'g> {
         self.extensions.baseline_sigma_m = Some(sigma_m);
         self
     }
-    /// Add f1 − f2 measurements; None shares the phase baseline.
+    /// Add f1 − f2 measurements; None shares the explicit phase baseline sequence.
+    /// A separate interferometer is paired with one ENU vector per measurement.
     pub fn differential_doppler(
         mut self,
         data: DifferentialDopplerData,
-        interferometer: Option<Interferometer>,
+        interferometer: Option<(Interferometer, Vec<V3>)>,
     ) -> Self {
         self.extensions.differential_doppler = Some(data);
-        self.extensions.differential_interferometer = interferometer;
+        if let Some((interferometer, baselines)) = interferometer {
+            self.extensions.differential_interferometer = Some(interferometer);
+            self.extensions.differential_baselines_enu_m = Some(baselines);
+        } else {
+            self.extensions.differential_interferometer = None;
+            self.extensions.differential_baselines_enu_m = None;
+        }
         self
     }
     /// Estimate an independent, separate Doppler baseline correction.
