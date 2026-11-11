@@ -1,6 +1,6 @@
 [package]
 name = "tychonic"
-version = "0.9.5"
+version = "0.9.6"
 edition = "2024"
 description = "Passive orbit determination with Doppler, interferometric phase, differential Doppler, and angles."
 license = "MIT OR Apache-2.0"
@@ -10,8 +10,9 @@ readme = "README.md"
 keywords = ["orbit-determination", "astrodynamics", "ekf", "doppler", "interferometry"]
 categories = ["aerospace", "science"]
 include = [
-    "Cargo.toml", "Cargo.lock", "clippy.toml", "README.md", "CHANGELOG.md", "LICENSE*",
-    "src/**", "tests/**", "benches/**", "examples/**", "docs/**",
+    "/Cargo.toml", "/Cargo.lock", "/clippy.toml", "/README.md", "/CHANGELOG.md",
+    "/LICENSE-MIT", "/LICENSE-APACHE", "/references/README.md",
+    "/src/**", "/tests/**", "/benches/**", "/examples/**", "/docs/**",
 ]
 
 [lib]

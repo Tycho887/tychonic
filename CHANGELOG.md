@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.6 (Unreleased)
+
+- Consolidate the 0.9.4 absolute calibrated covariance APIs and 0.9.5 behavioral
+  antenna/receiver kernels in the canonical upstream checkout.
+- Align the development-tools dependency lockfile with the library version.
+- Anchor source-package entries to the repository root, excluding local
+  Python-environment files while retaining the citation index.
+- Update release metadata and document local release preparation.
+
 ## 0.9.5
 
 - Add reusable caller-clocked behavioral mount and receiver simulation kernels.

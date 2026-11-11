@@ -36,8 +36,8 @@ generation-2 normalized contract, with held-out later observations for EKF.
 
 ## Release and repository boundary
 
-Implement in an isolated upstream checkout. Preserve unrelated work in the
-original tychonic checkout. This source must never become a DART path or Git
-dependency. Prepare a publishable next patch release and release notes after
-verification; DART integration must wait for the registry release. Do not
-publish or push without the owning agent coordinating the release.
+Develop and verify upstream changes in the canonical local tychonic checkout,
+`/home/michaeljohansen/tychonic`. Preserve unrelated local work. This source must
+never become a DART path or Git dependency. Prepare a patch release and release
+notes after verification; DART integration must use the published registry
+release. The repository owner performs publication.
