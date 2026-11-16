@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.7 (Unreleased)
+## 0.9.7 (2026-11-11)
 
 - **Breaking:** move surveyed baselines out of `Interferometer`; construction now
   takes only the nominal carrier frequency. Phase-difference and differential

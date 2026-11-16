@@ -1,8 +1,13 @@
-# Prepare v0.9.7 for crates.io
+# Tychonic crates.io releases
 
-Status: unreleased. The canonical source checkout is
-`/home/michaeljohansen/tychonic`. Prepare and verify changes in this repository.
-Publication and the release tag remain the repository owner's responsibility.
+Version **0.9.7** was published to crates.io on **2026-11-11** from clean commit
+`ce3d7bcb6dab25bc0321f3397be881a719441346`. Its release tag is `v0.9.7`.
+The published archive's SHA-256 is
+`0f5b6a4c16ee6bfcf09cfb7bc2d50934e44392e1c0d17e8fd8f00facad4bbbdf`.
+
+The canonical source checkout is `/home/michaeljohansen/tychonic`. Prepare and
+verify future releases in this repository. Before the next publication, update
+the package version, both lockfiles, installation example, and changelog.
 
 Tychonic distributes portable Rust source as `tychonic-0.9.7.crate`. The manifest
 allowlist uses repository-root paths and includes library source, tests,
@@ -34,15 +39,16 @@ publication. Test and benchmark fixtures must depend only on packaged files.
 Simulation reproduction instructions are in the repository's
 [tools guide](https://github.com/Tycho887/tychonic/blob/main/tools/README.md).
 
-After the release commit is reviewed, tag it `v0.9.7`. Authenticate with Cargo's
-credential flow, then verify and publish to crates.io:
+Version 0.9.7 is already published and cannot be published again. For a future
+version, review the release commit and tag it with that version. Authenticate
+with Cargo's credential flow, then verify and publish to crates.io:
 
 ```sh
 cargo publish --locked --dry-run
 cargo publish --locked
 ```
 
-Version 0.9.7 can be published only once.
+Each version can be published only once.
 
 Consumers install from crates.io:
 

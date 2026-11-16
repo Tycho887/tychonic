@@ -11,12 +11,12 @@ and any combination can be fused with full covariance. Fitting requires an
 initial orbit guess; initialization without one is future work. IQ processing,
 phase unwrapping, and cycle-slip detection belong upstream.
 
-The local source is prepared for **0.9.7**; publication is pending. It includes
+Version **0.9.7** was published to crates.io on 2026-11-11. It includes
 the absolute calibrated covariance APIs from 0.9.4 and the behavioral antenna
 and receiver kernels from 0.9.5. See the [simulation guide](docs/simulation.md)
 for the caller-clocked plant interface.
 
-## Install after publication
+## Install
 
 Add tychonic from [crates.io](https://crates.io/crates/tychonic):
 
