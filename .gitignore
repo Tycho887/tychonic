@@ -7,3 +7,10 @@ __pycache__/
 *.py[cod]
 /python/target/
 /python/tychonic/_native*.so
+
+# Python virtual environments at any directory depth
+.venv*/
+venv/
+venv-*/
+env/
+ENV/

@@ -56,6 +56,43 @@ cargo publish --locked
 
 Each version can be published only once.
 
+## GitHub release publishing
+
+The workflows publish automatically when a release tag is pushed:
+
+| Tag | Destination | Required validation |
+| --- | --- | --- |
+| `python-v<PYTHON_VERSION>` | TestPyPI | Python 3.11–3.14 wheels, source archive, tests, lint, and archive checks |
+| `v<RUST_VERSION>` | crates.io | Rust contracts, long release regressions, native comparisons, and workspace package verification |
+
+Python tags must match `pyproject.toml`. Rust tags must match the core and
+constrained crate versions, including the companion's exact core dependency.
+The Rust job publishes `tychonic` first, then `tychonic-constrained`. Branch
+pushes and pull requests run validation without publishing. Production PyPI
+publication remains a manual dispatch of `python.yml` from a Python release
+tag with `publish_to=pypi`; `publish_to=testpypi` also permits manual TestPyPI
+publication.
+
+Configure these publishers before pushing a new release tag:
+
+- On TestPyPI, register GitHub owner `Tycho887`, repository `tychonic`, workflow
+  `python.yml`, and environment `testpypi` for project `tychonic`. Use the same
+  fields with environment `pypi` on production PyPI if needed.
+- On crates.io, register GitHub owner `Tycho887`, repository `tychonic`, workflow
+  `rust.yml`, and environment `cratesio` for both Rust crates. The workflow uses
+  `rust-lang/crates-io-auth-action@v1` to obtain a temporary upload token. For a
+  crate's first publication or when Trusted Publishing is unavailable, provide
+  an API token authorized for both crates as the GitHub Actions secret
+  `CARGO_REGISTRY_TOKEN`; this takes precedence over Trusted Publishing.
+- Create the matching GitHub environments `testpypi`, `pypi` (if used), and
+  `cratesio`. Any configured environment approval rules still apply.
+
+The release tag must point to a commit containing the corrected workflow and
+matching package versions. Rerunning a failed run uses the workflow from its
+original commit. When preparing a new Python version, also update
+`python/Cargo.toml` and `python/Cargo.lock`. An uploaded distribution cannot be
+overwritten, so use an unused version for subsequent TestPyPI releases.
+
 Consumers install from crates.io:
 
 ```toml

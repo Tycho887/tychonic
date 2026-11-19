@@ -215,7 +215,7 @@ impl NlpProblem for Adapter<'_> {
     }
     fn jacobian_values(&self, x: &[f64], _: bool, out: &mut [f64]) -> bool {
         self.read(x, |v| {
-            for (row, jac) in out.chunks_exact_mut(7).zip(&v.cone_jacobian) {
+            for (row, jac) in out.as_chunks_mut::<7>().0.iter_mut().zip(&v.cone_jacobian) {
                 self.scaled_gradient(jac, row);
             }
         }) && out.iter().all(|v| v.is_finite())
