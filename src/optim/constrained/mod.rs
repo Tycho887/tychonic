@@ -1,10 +1,14 @@
-//! Seven-variable range-rate NLP with projected contact biases and hard pointing cones.
+//! Fit range rates with projected contact biases and hard pointing cones.
 use super::{ContactBiasMap, ContactId, ContactRangeRate};
 use crate::kernels::*;
 use numeris::{DynMatrix, DynVector, Matrix};
 use satkit::Instant;
 use std::collections::{BTreeMap, BTreeSet};
+mod initialization;
 mod selection;
+mod solver;
+pub use ripopt::SolveStatus;
+pub use solver::{ConstrainedFit, FitError, FitOptions, fit_constrained_range_rate};
 
 /// A measured boresight in local ENU, with azimuth clockwise from north (radians).
 #[derive(Debug, Clone, Copy)]

@@ -1,10 +1,10 @@
 //! Compare independent NLP solvers on the same prepared orbit and cone constraints.
 #![cfg(feature = "native-reference")]
-#[path = "../../constrained/tests/support/mod.rs"]
+#[path = "../../tests/support/constrained.rs"]
 mod support;
 use ipopt::{BasicProblem, ConstrainedProblem, Index, Ipopt};
 use tychonic::kernels::{M7, V7};
-use tychonic_constrained::*;
+use tychonic::optim::constrained::*;
 
 struct Reference<'a> {
     model: &'a ConstrainedRangeRateProblem,

@@ -19,7 +19,7 @@ jobs:
       SATKIT_DATA: /tmp/satkit-data
     steps:
       - uses: actions/checkout@v4
-      - name: Verify Rust release tag and crate versions
+      - name: Verify Rust release tag
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -30,14 +30,9 @@ jobs:
           from pathlib import Path
 
           core = tomllib.loads(Path('Cargo.toml').read_text())
-          companion = tomllib.loads(Path('constrained/Cargo.toml').read_text())
           version = core['package']['version']
           if os.environ['RELEASE_TAG'] != f'v{version}':
               raise SystemExit('release tag must match the core crate version')
-          if companion['package']['version'] != version:
-              raise SystemExit('core and constrained crate versions must match')
-          if companion['dependencies']['tychonic']['version'] != f'={version}':
-              raise SystemExit('constrained must depend on the matching core version')
           PY
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,16 +49,16 @@ jobs:
       - run: python3 scripts/check_core_policy.py
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path tools/Cargo.toml --all -- --check
-      - run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo check --manifest-path tools/Cargo.toml --locked --all-targets --features profile-allocations
       - run: cargo run --locked --manifest-path tools/Cargo.toml --bin provision_data
       - run: cargo test --locked
         env:
           SATKIT_OFFLINE: '1'
-      - run: cargo test --locked --release -p tychonic-constrained
+      - run: cargo test --locked --release --test constrained_fit
         env:
           SATKIT_OFFLINE: '1'
-      - run: cargo doc --workspace --locked --no-deps --lib
+      - run: cargo doc --locked --no-deps --lib
       - if: inputs.release_checks || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         run: cargo test --locked --release --test bootstrap bootstrap_24_hour_fit_recovers_state_and_drag_from_weak_pointing -- --ignored --exact
         env:
@@ -73,8 +68,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y coinor-libipopt-dev libclang-dev cmake
           cargo test --locked --release --manifest-path tools/Cargo.toml --features native-reference --test native_reference -- --test-threads=1
-          cargo test --locked --release -p tychonic-constrained --test fit -- --ignored --nocapture --test-threads=1
-          cargo package --workspace --locked
+          cargo test --locked --release --test constrained_fit -- --ignored --nocapture --test-threads=1
+          cargo package --locked
         env:
           SATKIT_OFFLINE: '1'
           IPOPT_NO_PKG_CONFIG: '1'
@@ -100,9 +95,7 @@ jobs:
         if: env.CARGO_REGISTRY_TOKEN == ''
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
-      - name: Publish core, then constrained crate
+      - name: Publish tychonic
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
-        run: |
-          cargo publish --locked -p tychonic
-          cargo publish --locked -p tychonic-constrained
+        run: cargo publish --locked

@@ -1,7 +1,8 @@
+#[path = "support/constrained.rs"]
 mod support;
 use support::*;
+use tychonic::optim::constrained::*;
 use tychonic::{kernels::V7, optim::ContactId};
-use tychonic_constrained::*;
 
 #[test]
 fn projected_objective_and_cone_derivatives() {

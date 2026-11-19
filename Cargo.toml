@@ -1,6 +1,4 @@
 [workspace]
-members = ["constrained"]
-default-members = ["."]
 exclude = ["tools", "python"]
 resolver = "3"
 
@@ -27,6 +25,7 @@ path = "src/lib.rs"
 
 [dependencies]
 numeris = { version = "=0.6.0", features = ["optim", "estimate"] }
+ripopt = { version = "=0.8.2", default-features = false }
 satkit = "=0.24.1"
 
 [dev-dependencies]

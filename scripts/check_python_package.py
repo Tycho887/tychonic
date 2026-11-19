@@ -21,7 +21,8 @@ def contents(path):
     required = {
         "Cargo.toml",
         "src/lib.rs",
-        "constrained/src/lib.rs",
+        "src/optim/constrained/solver.rs",
+        "tests/support/constrained.rs",
         "python/Cargo.lock",
         "python/Cargo.toml",
         "python/src/lib.rs",

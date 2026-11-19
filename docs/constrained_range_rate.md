@@ -1,19 +1,17 @@
 # Constrained range-rate batch fitting
 
-Tychonic 0.10.0 provides the prepared orbit model in
-`tychonic::optim::constrained`. The companion crate `tychonic-constrained`
-pins the Rust interior-point solver ripopt 0.8.2. Applications can depend on
-the two crates through these workspace paths when developing against this checkout.
+`tychonic::optim::constrained` provides the prepared orbit model and the
+interior-point fitter using ripopt 0.8.2. When developing against this checkout,
+depend on the repository root.
 
 ```toml
 [dependencies]
 tychonic = { path = "/path/to/tychonic" }
-tychonic-constrained = { path = "/path/to/tychonic/constrained" }
 ```
 
 ```rust
 use tychonic::kernels::{ParameterMode, PropagationConfig, od_prop_settings};
-use tychonic_constrained::{ConstrainedRangeRateProblem, FitOptions, fit_constrained_range_rate};
+use tychonic::optim::constrained::{ConstrainedRangeRateProblem, FitOptions, fit_constrained_range_rate};
 
 let config = PropagationConfig::new(
     reference_epoch, od_prop_settings(), ParameterMode::StateAndDrag { delta_cd: 1e-4 },
@@ -77,7 +75,7 @@ The result includes the physical state, biases keyed by contact, whitened
 range-rate RSS, selected pointings, solver status and iteration count,
 sensitivity evaluation count, and maximum positive angular excess in radians.
 Only the selected pointings define feasibility. Re-evaluate an `All` model at
-the fitted parameters to check the omitted directions. The companion accepts
+the fitted parameters to check the omitted directions. The fitter accepts
 optimal and acceptable solver terminations after checking angular feasibility.
 A failed evaluation, solver termination, or a returned orbit outside the
 angular tolerance produces a typed error. The fitter returns a point estimate.
@@ -120,8 +118,8 @@ Provision Satkit data and set `SATKIT_DATA` to that directory. Run these checks
 from the repository root.
 
 ```sh
-cargo test --locked --release -p tychonic-constrained
-cargo test --locked --release -p tychonic-constrained --test fit -- --ignored --nocapture --test-threads=1
+cargo test --locked --release --test constrained_fit
+cargo test --locked --release --test constrained_fit -- --ignored --nocapture --test-threads=1
 cargo test --locked --release --test bootstrap bootstrap_24_hour_fit_recovers_state_and_drag_from_weak_pointing -- --ignored --exact
 ```
 

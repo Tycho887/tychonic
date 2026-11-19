@@ -1,14 +1,12 @@
 //! Rust interior-point batch fitting for seven-dimensional state and drag.
-#![forbid(unsafe_code)]
-mod initialization;
-pub use ripopt::SolveStatus;
-use ripopt::{NlpProblem, SolverOptions};
-use std::{collections::BTreeMap, fmt};
-pub use tychonic::optim::constrained::*;
-use tychonic::{
-    kernels::{KernelError, M7, V7},
-    optim::ContactId,
+use super::{
+    ConstrainedRangeRateProblem, ContactPointing, DEFAULT_SCALES, RangeRateEvaluation, SolveStatus,
+    initialization,
 };
+use crate::kernels::{KernelError, M7, V7};
+use crate::optim::ContactId;
+use ripopt::{NlpProblem, SolverOptions};
+use std::{cell::Cell, collections::BTreeMap, fmt};
 
 /// Tolerances apply to the scaled NLP and the final physical cone check respectively.
 #[derive(Debug)]
@@ -46,7 +44,7 @@ pub enum FitError {
     ConflictingPointings {
         first: ContactId,
         second: ContactId,
-        time: tychonic::satkit::Instant,
+        time: satkit::Instant,
     },
     Evaluation(KernelError),
     Solver {
@@ -111,8 +109,7 @@ struct Adapter<'a> {
     basis: M7,
     initial: [f64; 7],
     // ripopt requires shared callback receivers. Each sequential solve owns this cache.
-    #[allow(clippy::disallowed_types)]
-    cache: std::cell::RefCell<Cache>,
+    cache: Cell<Cache>,
 }
 
 impl<'a> Adapter<'a> {
@@ -157,9 +154,8 @@ impl<'a> Adapter<'a> {
         let Ok(key) = <&[f64; 7]>::try_from(x) else {
             return false;
         };
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.take();
         if cache.point.as_ref().map(|p| &p.0) != Some(key) {
-            cache.point = None;
             cache.evaluations += 1;
             match self.model.evaluate(&self.physical(key)) {
                 Ok(value) => {
@@ -167,16 +163,17 @@ impl<'a> Adapter<'a> {
                     cache.error = None;
                 }
                 Err(e) => {
+                    cache.point = None;
                     cache.error = Some(e);
-                    return false;
                 }
             }
         }
+        let valid = cache.point.is_some();
         if let Some((_, value)) = &cache.point {
             write(value);
-            return true;
         }
-        false
+        self.cache.set(cache);
+        valid
     }
 }
 impl NlpProblem for Adapter<'_> {
@@ -241,7 +238,7 @@ pub fn fit_constrained_range_rate(
             time: a.time,
         });
     }
-    let adapter = Adapter::new(model, &options.scales)?;
+    let mut adapter = Adapter::new(model, &options.scales)?;
     let mut settings = SolverOptions {
         hessian_approximation_lbfgs: true,
         enable_preprocessing: false,
@@ -253,7 +250,7 @@ pub fn fit_constrained_range_rate(
         max_iter: options.max_iterations,
         ..Default::default()
     };
-    let result = solve_with_barrier_retry(&adapter, &mut settings);
+    let result = solve_with_barrier_retry(&mut adapter, &mut settings);
     let failure = || FitError::Solver {
         status: result.status,
         iterations: result.iterations,
@@ -262,10 +259,12 @@ pub fn fit_constrained_range_rate(
         result.status,
         SolveStatus::Optimal | SolveStatus::Acceptable
     ) {
-        if let Some(error) = adapter.cache.borrow_mut().error.take() {
-            return Err(error.into());
-        }
-        return Err(failure());
+        return Err(adapter
+            .cache
+            .into_inner()
+            .error
+            .map(FitError::from)
+            .unwrap_or_else(failure));
     }
     let key = result.x.as_slice().try_into().map_err(|_| failure())?;
     let parameters = adapter.physical(key);
@@ -296,13 +295,13 @@ pub fn fit_constrained_range_rate(
 // stationarity. Retry with an adaptive barrier from the validated start, sharing
 // the caller's iteration budget. Only a solver-confirmed termination is accepted.
 fn solve_with_barrier_retry(
-    adapter: &Adapter<'_>,
+    adapter: &mut Adapter<'_>,
     settings: &mut SolverOptions,
 ) -> ripopt::SolveResult {
     let first = ripopt::solve(adapter, settings);
     if first.status != SolveStatus::NumericalError
         || first.iterations >= settings.max_iter
-        || adapter.cache.borrow().error.is_some()
+        || adapter.cache.get_mut().error.is_some()
     {
         return first;
     }
@@ -328,7 +327,7 @@ fn validate_options(options: &FitOptions) -> Result<(), FitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tychonic::{kernels::*, optim::ContactRangeRate, satkit::Instant};
+    use crate::{kernels::*, optim::ContactRangeRate, satkit::Instant};
 
     #[test]
     fn callbacks_share_exact_key_and_invalidate_failed_refresh() {
@@ -360,7 +359,7 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        let adapter = Adapter::new(&model, &DEFAULT_SCALES).unwrap();
+        let mut adapter = Adapter::new(&model, &DEFAULT_SCALES).unwrap();
         let mut x = [0.; 7];
         let mut f = -1.;
         assert!(adapter.objective(&x, true, &mut f));
@@ -368,12 +367,14 @@ mod tests {
         assert!(adapter.constraints(&x, true, &mut []));
         assert!(adapter.gradient(&x, false, &mut [0.; 7]));
         assert!(adapter.jacobian_values(&x, true, &mut []));
-        assert_eq!(adapter.cache.borrow().evaluations, 1);
+        assert_eq!(adapter.cache.get_mut().evaluations, 1);
         x[6] = -0.1;
         assert!(!adapter.objective(&x, false, &mut f));
-        assert!(adapter.cache.borrow().point.is_none());
+        assert!(adapter.cache.get_mut().point.is_none());
+        assert!(adapter.cache.get_mut().error.is_some());
         x[6] = 0.;
         assert!(adapter.gradient(&x, false, &mut [0.; 7]));
-        assert_eq!(adapter.cache.borrow().evaluations, 3);
+        assert_eq!(adapter.cache.get_mut().evaluations, 3);
+        assert!(adapter.cache.get_mut().error.is_none());
     }
 }

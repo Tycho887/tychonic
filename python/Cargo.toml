@@ -18,7 +18,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 tychonic = { path = ".." }
-tychonic-constrained = { path = "../constrained" }
 pyo3 = { version = "0.27", features = ["extension-module"] }
 numpy = "0.27"
 serde = { version = "1", features = ["derive"] }

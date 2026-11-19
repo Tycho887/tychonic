@@ -90,11 +90,11 @@ pub fn contacts(
                 near.map_or(PointingSelection::All, PointingSelection::NearTca),
             )
             .map_err(kernel_error)?;
-            let mut opts = tychonic_constrained::FitOptions::default();
+            let mut opts = FitOptions::default();
             if let Some(n) = iterations {
                 opts.max_iterations = n;
             }
-            let fit = tychonic_constrained::fit_constrained_range_rate(&model, &opts)
+            let fit = fit_constrained_range_rate(&model, &opts)
                 .map_err(|e| SolverError::new_err(e.to_string()))?;
             Ok((
                 fit.parameters.as_slice().to_vec(),

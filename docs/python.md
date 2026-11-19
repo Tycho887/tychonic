@@ -80,8 +80,8 @@ weights and original ancestor indices.
 
 ## Local builds
 
-The core and constrained crates stay in their published locations. The private
-extension has an independent Cargo workspace and lockfile in `python/`. From the
+The private extension depends on the root `tychonic` crate and has its own
+Cargo workspace and lockfile in `python/`. From the
 repository root, run `maturin build --release --locked` or `maturin sdist`.
 Install the wheel into a fresh environment and run `pytest -q python/tests`
 with both optional extras installed. Python release tags use `python-v<VERSION>`.

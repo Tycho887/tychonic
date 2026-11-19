@@ -1008,15 +1008,8 @@ name = "tychonic"
 version = "0.10.1"
 dependencies = [
  "numeris",
- "satkit",
-]
-
-[[package]]
-name = "tychonic-constrained"
-version = "0.10.1"
-dependencies = [
  "ripopt",
- "tychonic",
+ "satkit",
 ]
 
 [[package]]
@@ -1028,7 +1021,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tychonic",
- "tychonic-constrained",
 ]
 
 [[package]]

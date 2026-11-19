@@ -2,10 +2,9 @@
 use tychonic::{
     kernels::*,
     numeris::DynVector,
-    optim::{ContactId, ContactRangeRate},
+    optim::{ContactId, ContactRangeRate, constrained::*},
     satkit::{Duration, ITRFCoord, Instant, frametransform},
 };
-use tychonic_constrained::*;
 
 pub struct Fixture {
     pub truth: V7,

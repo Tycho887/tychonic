@@ -5,15 +5,13 @@ Version **0.9.7** was published to crates.io on **2026-11-11** from clean commit
 The published archive's SHA-256 is
 `0f5b6a4c16ee6bfcf09cfb7bc2d50934e44392e1c0d17e8fd8f00facad4bbbdf`.
 
-The 0.10.0 workspace contains `tychonic` and `tychonic-constrained`. Verify
-both source packages together with `cargo package --workspace --locked`.
-For publication, publish the core first, then the companion after the registry
-can resolve the matching core version. The companion's native IPOPT comparison
-runs separately from its Rust build. See the [qualification commands](constrained_range_rate.md).
+The `tychonic` crate includes the constrained fitter. Its native IPOPT comparison
+runs in the development tools crate. See the [qualification commands](constrained_range_rate.md).
 
 The canonical source checkout is `/home/michaeljohansen/tychonic`. Prepare and
 verify future releases in this repository. Before the next publication, update
-the package version, both lockfiles, installation example, and changelog.
+the package version, the root, Python, and tools Cargo lockfiles, the installation
+example, and the changelog.
 
 Tychonic distributes portable Rust source as `tychonic-0.9.7.crate`. The manifest
 allowlist uses repository-root paths and includes library source, tests,
@@ -63,11 +61,10 @@ The workflows publish automatically when a release tag is pushed:
 | Tag | Destination | Required validation |
 | --- | --- | --- |
 | `python-v<PYTHON_VERSION>` | TestPyPI | Python 3.11–3.14 wheels, source archive, tests, lint, and archive checks |
-| `v<RUST_VERSION>` | crates.io | Rust contracts, long release regressions, native comparisons, and workspace package verification |
+| `v<RUST_VERSION>` | crates.io | Rust contracts, long release regressions, native comparisons, and crate verification |
 
-Python tags must match `pyproject.toml`. Rust tags must match the core and
-constrained crate versions, including the companion's exact core dependency.
-The Rust job publishes `tychonic` first, then `tychonic-constrained`. Branch
+Python tags must match `pyproject.toml`. Rust tags must match the package
+version in the root `Cargo.toml`. The Rust job publishes `tychonic`. Branch
 pushes and pull requests run validation without publishing. Production PyPI
 publication remains a manual dispatch of `python.yml` from a Python release
 tag with `publish_to=pypi`; `publish_to=testpypi` also permits manual TestPyPI
@@ -79,10 +76,10 @@ Configure these publishers before pushing a new release tag:
   `python.yml`, and environment `testpypi` for project `tychonic`. Use the same
   fields with environment `pypi` on production PyPI if needed.
 - On crates.io, register GitHub owner `Tycho887`, repository `tychonic`, workflow
-  `rust.yml`, and environment `cratesio` for both Rust crates. The workflow uses
+  `rust.yml`, and environment `cratesio` for the `tychonic` crate. The workflow uses
   `rust-lang/crates-io-auth-action@v1` to obtain a temporary upload token. For a
   crate's first publication or when Trusted Publishing is unavailable, provide
-  an API token authorized for both crates as the GitHub Actions secret
+  an API token authorized for `tychonic` as the GitHub Actions secret
   `CARGO_REGISTRY_TOKEN`; this takes precedence over Trusted Publishing.
 - Create the matching GitHub environments `testpypi`, `pypi` (if used), and
   `cratesio`. Any configured environment approval rules still apply.

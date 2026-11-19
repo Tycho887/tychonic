@@ -1,5 +1,6 @@
 //! A local initializer in the projected range-rate metric, with frozen cones.
-use super::*;
+use super::{ConstrainedRangeRateProblem, RangeRateEvaluation};
+use crate::kernels::{M7, Result, V7};
 pub(super) struct Start {
     pub origin: V7,
     pub basis: M7,
@@ -59,10 +60,7 @@ impl Start {
     }
 }
 
-pub(super) fn prepare(
-    model: &ConstrainedRangeRateProblem,
-    scales: &[f64; 7],
-) -> Result<Start, KernelError> {
+pub(super) fn prepare(model: &ConstrainedRangeRateProblem, scales: &[f64; 7]) -> Result<Start> {
     let (value, basis) = model.linearize(model.seed(), scales)?;
     let mut start = Start {
         origin: *model.seed(),
