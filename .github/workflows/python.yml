@@ -47,8 +47,9 @@ jobs:
       - uses: PyO3/maturin-action@v1
         with:
           target: x86_64
+          # This input adds --manylinux; do not duplicate it in args.
           manylinux: '2_28'
-          args: --release --locked --out dist --interpreter python${{ matrix.python }} --compatibility manylinux_2_28
+          args: --release --locked --out dist --interpreter python${{ matrix.python }}
       - run: python -m pip install numpy==1.26.4 satkit==0.24.1 pytest ruff pandas polars
         if: matrix.python == '3.11'
       - run: python -m pip install numpy satkit==0.24.1 pytest ruff pandas polars
