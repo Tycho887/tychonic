@@ -1,7 +1,6 @@
-# DART Phase 1 covariance requirements
+# Batch covariance requirements
 
-Status: implemented and independently verified for 0.9.4.
-Consumer: DART registry dependency.
+Version 0.9.4 implemented these requirements for downstream registry consumers.
 
 ## Additive interface
 
@@ -31,13 +30,12 @@ Write failing tests before implementation. Verify an analytic linear reference,
 correlated-noise whitening, optimizer-scale invariance, singular/underdetermined
 geometry, non-finite input, and noisy mixed Doppler/phase/differential/angle orbit
 recovery. Check all retained APIs and tests, Rustdoc, formatting, and Clippy.
-Include a deterministic mixed-observation JSON fixture suitable for DART's
-generation-2 normalized contract, with held-out later observations for EKF.
+Include a deterministic mixed-observation JSON fixture for consumers of the
+generation-2 observation contract, with held-out later observations for EKF.
 
 ## Release and repository boundary
 
 Develop and verify upstream changes in the canonical local tychonic checkout,
-`/home/michaeljohansen/tychonic`. Preserve unrelated local work. This source must
-never become a DART path or Git dependency. Prepare a patch release and release
-notes after verification; DART integration must use the published registry
-release. The repository owner performs publication.
+`/home/michaeljohansen/tychonic`. Preserve unrelated local work. Downstream
+integrations depend on the published registry release. Prepare a patch release
+and release notes after verification. The repository owner performs publication.

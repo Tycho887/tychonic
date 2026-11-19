@@ -46,6 +46,7 @@ pub fn tca_measurement_noise(sigma_rr: f64) -> Result<MeasurementNoise> {
 /// constant, with optional caller-supplied discretized process covariance.
 #[derive(Debug)]
 pub struct TcaUkf {
+    doppler_hz: bool,
     prior: TLE,
     estimate: TcaEstimate,
 }
@@ -74,12 +75,63 @@ impl TcaUkf {
         check_finite(&initial_state_from_tle(&corrected, &epoch)?)?;
         Ok(Self {
             prior,
+            doppler_hz: false,
             estimate: TcaEstimate {
                 epoch,
                 state: initial,
                 covariance,
             },
         })
+    }
+
+    /// Persistent seconds/Hz estimate. The carrier belongs to each observation.
+    pub fn new_doppler(
+        prior: TLE,
+        epoch: Instant,
+        initial: TcaState,
+        covariance: TcaCovariance,
+    ) -> Result<Self> {
+        let mut filter = Self::new(prior, epoch, initial, covariance)?;
+        filter.doppler_hz = true;
+        Ok(filter)
+    }
+
+    /// Joint absolute Doppler Hz and local azimuth/elevation in radians.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_doppler(
+        &mut self,
+        time: Instant,
+        station: &StationGeometry,
+        values: V3,
+        carrier_hz: f64,
+        covariance: &Matrix<f64, 3, 3>,
+        q: Option<&TcaCovariance>,
+        options: UpdateOptions,
+    ) -> Result<UpdateResult<3>> {
+        if !self.doppler_hz || !carrier_hz.is_finite() || carrier_hz <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "Hz filter and positive carrier required",
+            ));
+        }
+        validate_values(&values, options)?;
+        check_covariance(covariance, true)?;
+        let sigmas = V3::from_fn(|i, _| covariance[(i, i)].sqrt());
+        let correlation = Matrix::from_fn(|i, j| covariance[(i, j)] / sigmas[i] / sigmas[j]);
+        let mut candidate = self.estimate;
+        predict_estimate(&mut candidate, time, q)?;
+        let result = self.update(
+            &mut candidate,
+            &values,
+            station,
+            &SensorNoise {
+                sigmas,
+                correlation,
+                rate_scale: -carrier_hz / crate::kernels::SPEED_OF_LIGHT,
+            },
+            options,
+        )?;
+        self.estimate = candidate;
+        Ok(result)
     }
 
     pub fn state(&self) -> &TcaState {
@@ -128,6 +180,9 @@ impl TcaUkf {
         q: Option<&TcaCovariance>,
         options: UpdateOptions,
     ) -> Result<UpdateResult<3>> {
+        if self.doppler_hz {
+            return Err(KernelError::InvalidInput("use observe_doppler for Hz bias"));
+        }
         let observed = measurement_values(measurement, options)?;
         let sigmas = measurement_sigmas(noise)?;
         let mut candidate = self.estimate;
@@ -136,7 +191,17 @@ impl TcaUkf {
         let station = geometry
             .row(0)
             .ok_or(KernelError::InvalidInput("TCA station geometry"))?;
-        let result = self.update(&mut candidate, &observed, station, &sigmas, options)?;
+        let result = self.update(
+            &mut candidate,
+            &observed,
+            station,
+            &SensorNoise {
+                sigmas,
+                correlation: Matrix::eye(),
+                rate_scale: 1.0,
+            },
+            options,
+        )?;
         self.estimate = candidate;
         Ok(result)
     }
@@ -146,26 +211,22 @@ impl TcaUkf {
         candidate: &mut TcaEstimate,
         observed: &V3,
         geometry: &StationGeometry,
-        noise_sigmas: &V3,
+        noise: &SensorNoise,
         options: UpdateOptions,
     ) -> Result<UpdateResult<3>> {
         let sigmas = sigma_points(&candidate.state, &candidate.covariance)?;
         let mut predictions = [V3::zeros(); 5];
         for (prediction, sigma) in predictions.iter_mut().zip(&sigmas) {
-            *prediction = self.predict_measurement(sigma, geometry, candidate.epoch)?;
+            *prediction =
+                self.predict_measurement(sigma, geometry, candidate.epoch, noise.rate_scale)?;
         }
-        let transform = measurement_transform(
-            &candidate.state,
-            &sigmas,
-            &predictions,
-            observed,
-            noise_sigmas,
-        )?;
+        let transform =
+            measurement_transform(&candidate.state, &sigmas, &predictions, observed, noise)?;
         let factor = transform
             .covariance
             .cholesky()
             .map_err(|_| KernelError::Singular)?;
-        let innovation = normalize(&transform.innovation, noise_sigmas);
+        let innovation = normalize(&transform.innovation, &noise.sigmas);
         let nis = innovation.dot(&factor.solve(&innovation));
         if !nis.is_finite() || nis < 0.0 {
             return Err(KernelError::Numerical("TCA UKF NIS exceeds numeric range"));
@@ -176,8 +237,13 @@ impl TcaUkf {
                 .solve_matrix(&transform.cross.transpose())
                 .transpose();
             let state = candidate.state + gain * innovation;
-            let covariance =
-                posterior_covariance(&candidate.state, &sigmas, &transform.deviations, &gain);
+            let covariance = posterior_covariance(
+                &candidate.state,
+                &sigmas,
+                &transform.deviations,
+                &gain,
+                &noise.correlation,
+            );
             check_finite(&state)?;
             shifted_tle(&self.prior, state[0])?;
             check_covariance(&covariance, true)?;
@@ -196,6 +262,7 @@ impl TcaUkf {
         state: &TcaState,
         geometry: &StationGeometry,
         epoch: Instant,
+        rate_scale: f64,
     ) -> Result<V3> {
         let tle = shifted_tle(&self.prior, state[0])?;
         let satellite = initial_state_from_tle(&tle, &epoch)?;
@@ -207,7 +274,7 @@ impl TcaUkf {
             geometry.velocity(),
         )?;
         let (angles, _) = az_el_partial_prepared(&r, geometry.position(), geometry.rotation())?;
-        let predicted = V3::from_array([rr + state[1], angles[0], angles[1]]);
+        let predicted = V3::from_array([rr * rate_scale + state[1], angles[0], angles[1]]);
         check_finite(&predicted)?;
         Ok(predicted)
     }
@@ -260,8 +327,13 @@ fn measurement_values(measurement: &Measurement, options: UpdateOptions) -> Resu
         measurement.azimuth,
         measurement.elevation,
     ]);
-    check_finite(&value)?;
-    if measurement.elevation.abs() > std::f64::consts::FRAC_PI_2 {
+    validate_values(&value, options)?;
+    Ok(value)
+}
+
+fn validate_values(value: &V3, options: UpdateOptions) -> Result<()> {
+    check_finite(value)?;
+    if value[2].abs() > std::f64::consts::FRAC_PI_2 {
         return Err(KernelError::InvalidInput(
             "measurement elevation must be in [-pi/2, pi/2]",
         ));
@@ -274,7 +346,7 @@ fn measurement_values(measurement: &Measurement, options: UpdateOptions) -> Resu
             "TCA UKF NIS gate must be finite and nonnegative",
         ));
     }
-    Ok(value)
+    Ok(())
 }
 
 fn measurement_sigmas(noise: &MeasurementNoise) -> Result<V3> {
@@ -362,23 +434,29 @@ fn normalize(value: &V3, sigmas: &V3) -> V3 {
     ])
 }
 
+struct SensorNoise {
+    sigmas: V3,
+    correlation: Matrix<f64, 3, 3>,
+    rate_scale: f64,
+}
+
 fn measurement_transform(
     state: &TcaState,
     sigmas: &[TcaState; 5],
     predictions: &[V3; 5],
     observed: &V3,
-    noise_sigmas: &V3,
+    noise: &SensorNoise,
 ) -> Result<MeasurementTransform> {
     let mean = measurement_mean(predictions)?;
     let deviations = std::array::from_fn(|i| {
         normalize(
             &measurement_difference(&predictions[i], &mean),
-            noise_sigmas,
+            &noise.sigmas,
         )
     });
     // Whitening by the sensor standard deviations makes R=I and prevents mixed
     // m/s and radian units from conditioning the innovation covariance poorly.
-    let mut covariance = Matrix::<f64, 3, 3>::eye();
+    let mut covariance = noise.correlation;
     let mut cross = Matrix::<f64, 2, 3>::zeros();
     for i in 0..5 {
         let dx = sigmas[i] - state;
@@ -403,10 +481,11 @@ fn posterior_covariance(
     sigmas: &[TcaState; 5],
     deviations: &[V3; 5],
     gain: &Matrix<f64, 2, 3>,
+    correlation: &Matrix<f64, 3, 3>,
 ) -> TcaCovariance {
     // Equivalent to P - K S K^T, expressed as positive covariance terms to
     // avoid subtracting nearly equal matrices after a precise range-rate update.
-    let mut covariance = gain * gain.transpose();
+    let mut covariance = gain * correlation * gain.transpose();
     for i in 0..5 {
         let residual = sigmas[i] - state - gain * deviations[i];
         covariance += residual * residual.transpose() * COVARIANCE_WEIGHTS[i];
@@ -474,14 +553,30 @@ mod tests {
         let noise = V3::from_array([0.5, 0.05, 0.03]);
         let innovation = V3::from_array([0.4, 0.01, -0.02]);
         let observed = h * state + offset + innovation;
-        let transform =
-            measurement_transform(&state, &sigmas, &predictions, &observed, &noise).unwrap();
+        let transform = measurement_transform(
+            &state,
+            &sigmas,
+            &predictions,
+            &observed,
+            &SensorNoise {
+                sigmas: noise,
+                correlation: Matrix::eye(),
+                rate_scale: 1.0,
+            },
+        )
+        .unwrap();
         let factor = transform.covariance.cholesky().unwrap();
         let gain = factor
             .solve_matrix(&transform.cross.transpose())
             .transpose();
         let actual_state = state + gain * normalize(&transform.innovation, &noise);
-        let actual_p = posterior_covariance(&state, &sigmas, &transform.deviations, &gain);
+        let actual_p = posterior_covariance(
+            &state,
+            &sigmas,
+            &transform.deviations,
+            &gain,
+            &Matrix::eye(),
+        );
         let inverse_r = Matrix::new([
             [4.0, 0.0, 0.0],
             [0.0, 400.0, 0.0],
@@ -509,7 +604,11 @@ mod tests {
             &sigmas,
             &predictions,
             &observed,
-            &V3::from_array([1.0; 3]),
+            &SensorNoise {
+                sigmas: V3::from_array([1.0; 3]),
+                correlation: Matrix::eye(),
+                rate_scale: 1.0,
+            },
         )
         .unwrap();
         assert!((transform.innovation[1] - 0.01).abs() < 1e-14);

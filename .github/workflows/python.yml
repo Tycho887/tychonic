@@ -16,6 +16,9 @@ on:
 permissions:
   contents: read
 
+env:
+  SATKIT_DATA: /tmp/satkit-data
+
 jobs:
   wheels:
     runs-on: ubuntu-latest
@@ -23,8 +26,6 @@ jobs:
       fail-fast: false
       matrix:
         python: ['3.11', '3.12', '3.13', '3.14']
-    env:
-      SATKIT_DATA: ${{ runner.temp }}/satkit-data
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,9 +49,9 @@ jobs:
           target: x86_64
           manylinux: '2_28'
           args: --release --locked --out dist --interpreter python${{ matrix.python }} --compatibility manylinux_2_28
-      - run: python -m pip install numpy==1.26.4 satkit==0.24.1 pytest ruff
+      - run: python -m pip install numpy==1.26.4 satkit==0.24.1 pytest ruff pandas polars
         if: matrix.python == '3.11'
-      - run: python -m pip install numpy satkit==0.24.1 pytest ruff
+      - run: python -m pip install numpy satkit==0.24.1 pytest ruff pandas polars
         if: matrix.python != '3.11'
       - run: python -m pip install --no-deps dist/*.whl
       - run: pytest -q python/tests
@@ -77,8 +78,6 @@ jobs:
 
   sdist:
     runs-on: ubuntu-latest
-    env:
-      SATKIT_DATA: ${{ runner.temp }}/satkit-data
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -95,7 +94,7 @@ jobs:
           path: ${{ env.SATKIT_DATA }}
           key: satkit-data-0.24.1
       - run: cargo run --locked --manifest-path tools/Cargo.toml --bin provision_data
-      - run: python -m pip install build 'maturin>=1.10,<2' numpy satkit==0.24.1 pytest
+      - run: python -m pip install build 'maturin>=1.10,<2' numpy satkit==0.24.1 pytest pandas polars
       - run: python -m build --outdir dist
       - run: python scripts/check_python_package.py dist
       - run: python -m pip install --no-deps dist/*.whl

@@ -12,7 +12,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     env:
-      SATKIT_DATA: ${{ runner.temp }}/satkit-data
+      SATKIT_DATA: /tmp/satkit-data
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -22,6 +22,8 @@
         clippy::disallowed_methods
     )
 )]
+/// Version of the linked Rust core.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use numeris;
 pub use satkit;
 pub mod detection;

@@ -301,6 +301,21 @@ impl<const M: usize> MeasurementModel<M> for CalibratedSensor<'_, M> {
         }
         Ok((v, h))
     }
+    fn doppler_bias_partial(&self) -> Vector<f64, M> {
+        let first_is_doppler = match &self.model {
+            ModelSource::Owned(model) => {
+                matches!(model.0.first(), Some(Observable::Doppler { .. }))
+            }
+            ModelSource::Borrowed(model, _) => {
+                matches!(model.0.first(), Some(Observable::Doppler { .. }))
+            }
+        };
+        let mut partial = Vector::zeros();
+        if first_is_doppler {
+            partial[0] = 1.0;
+        }
+        partial
+    }
     fn innovation(&self, observed: &Vector<f64, M>, predicted: &Vector<f64, M>) -> Vector<f64, M> {
         let mut r = observed - predicted;
         if let Some(i) = self.model.azimuth_column() {
@@ -428,7 +443,7 @@ pub fn joint<'g>(
     ))
 }
 
-fn factor_covariance(covariance: &DynMatrix<f64>, m: usize) -> Result<DynCholesky<f64>> {
+pub(crate) fn factor_covariance(covariance: &DynMatrix<f64>, m: usize) -> Result<DynCholesky<f64>> {
     if covariance.nrows() != m
         || covariance.ncols() != m
         || !covariance.as_slice().iter().all(|v| v.is_finite())

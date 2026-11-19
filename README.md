@@ -11,7 +11,9 @@ and any combination can be fused with full covariance. Fitting requires an
 initial orbit guess; initialization without one is future work. IQ processing,
 phase unwrapping, and cycle-slip detection belong upstream.
 
-The upcoming **0.10.0** release adds seven-parameter range-rate fitting with
+The **0.10.1 release candidate** includes the [Python 0.2.0 bindings](docs/python.md),
+prior-weighted calibrated fits, and Doppler-bias filter catalogues. It also includes the
+0.10.0 additions for seven-parameter range-rate fitting with
 hard antenna field-of-view constraints, per-pass biases, and a Rust
 interior-point solver. See the [constrained fitting guide](docs/constrained_range_rate.md).
 

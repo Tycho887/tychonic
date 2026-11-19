@@ -200,7 +200,7 @@ fn rates_only_fit_matches_explicit_orbit_and_bias_solve() {
     let values = fixture.rates.iter().map(|r| r.range_rate).collect();
     let geometry = PreparedGeometry::new(&times, &sites).unwrap();
     let batch = PreparedBatch::range_rate(geometry, values, 1.).unwrap();
-    let raw = ODProblem::new(config_with_span(fixture.epoch, 5100.), vec![batch]).unwrap();
+    let raw = ODProblem::new(fixture.config(), vec![batch]).unwrap();
     let mut orbit = DynVector::from_slice(fixture.seed.as_slice());
     let mut biases = [0.; 3];
     for _ in 0..5 {
@@ -289,7 +289,7 @@ fn preparation_preserves_rate_rows_and_distinct_constraint_epochs() {
     f.angles[0].station = f.rates[0].station;
     assert!(
         ConstrainedRangeRateProblem::new(
-            config_with_span(f.epoch, 5100.),
+            f.config(),
             f.seed,
             &f.rates,
             &f.sigmas,

@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "tychonic"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "numeris",
  "satkit",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "tychonic-constrained"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "ripopt",
  "tychonic",

@@ -58,6 +58,11 @@ pub type SmoothedOrbit<const N: usize> = Vec<(Vector<f64, N>, Matrix<f64, N, N>)
 pub trait MeasurementModel<const M: usize> {
     fn evaluate(&self, state: &V6) -> crate::kernels::Result<(Vector<f64, M>, Matrix<f64, M, 6>)>;
 
+    /// Derivative of the predicted reading with respect to additive Doppler bias in Hz.
+    fn doppler_bias_partial(&self) -> Vector<f64, M> {
+        Vector::zeros()
+    }
+
     fn innovation(&self, observed: &Vector<f64, M>, predicted: &Vector<f64, M>) -> Vector<f64, M> {
         observed - predicted
     }
@@ -175,29 +180,91 @@ pub struct UpdateResult<const M: usize> {
 /// Six-state and seven-state filters share the batch solver's `ParameterMode`.
 pub struct OrbitEkf<const N: usize> {
     config: PropagationConfig,
+    bias_hz: bool,
     epoch: Instant,
     filter: Ekf<f64, N, 1>,
     timestamps: Vec<Instant>,
     steps: FilterHistory<N>,
 }
 
+impl OrbitEkf<7> {
+    /// Six Cartesian coordinates and a persistent additive Doppler bias in Hz.
+    pub fn with_doppler_bias(
+        config: PropagationConfig,
+        initial: Vector<f64, 7>,
+        covariance: Matrix<f64, 7, 7>,
+    ) -> EkfResult<Self> {
+        Self::initialize(config, initial, covariance, true)
+    }
+}
+
 impl<const N: usize> OrbitEkf<N> {
+    /// Set the current posterior as the beginning of a new smoothing interval.
+    pub fn discard_history(&mut self) {
+        self.steps = FilterHistory::new(record(self.filter.x, self.filter.p, Matrix::eye()));
+        self.timestamps.truncate(1);
+        self.timestamps[0] = self.epoch;
+    }
+
+    /// Install validated forward-pass records ending at this filter's current posterior.
+    pub fn restore_history(&mut self, records: Vec<(Instant, EkfStep<f64, N>)>) -> EkfResult<()> {
+        let invalid = KernelError::InvalidInput("invalid EKF smoothing history");
+        let Some((last, endpoint)) = records.last() else {
+            return Err(invalid.into());
+        };
+        if *last != self.epoch
+            || endpoint.x_updated != self.filter.x
+            || endpoint.p_updated != self.filter.p
+            || records.windows(2).any(|v| v[0].0 >= v[1].0)
+        {
+            return Err(invalid.into());
+        }
+        for (time, step) in &records {
+            if *time == Instant::INVALID || !is_finite(&step.f_jacobian) {
+                return Err(invalid.into());
+            }
+            check_parameters(&step.x_updated, !self.bias_hz)?;
+            check_parameters(&step.x_predicted, !self.bias_hz)?;
+            check_covariance(&step.p_updated, true)?;
+            check_covariance(&step.p_predicted, true)?;
+        }
+        let mut iter = records.into_iter();
+        let (epoch, step) = iter.next().ok_or(invalid)?;
+        self.timestamps = vec![epoch];
+        self.steps = FilterHistory::new(step);
+        for (epoch, step) in iter {
+            self.timestamps.push(epoch);
+            self.steps.push(step);
+        }
+        Ok(())
+    }
+
     pub fn new(
         config: PropagationConfig,
         initial: Vector<f64, N>,
         covariance: Matrix<f64, N, N>,
     ) -> EkfResult<Self> {
-        if N != config.mode().columns() {
+        Self::initialize(config, initial, covariance, false)
+    }
+
+    fn initialize(
+        config: PropagationConfig,
+        initial: Vector<f64, N>,
+        covariance: Matrix<f64, N, N>,
+        bias_hz: bool,
+    ) -> EkfResult<Self> {
+        if N != config.mode().columns() + usize::from(bias_hz) {
             return Err(KernelError::InvalidInput(
                 "EKF state dimension does not match parameter mode",
             )
             .into());
         }
-        check_parameters(&initial)?;
+        check_parameters(&initial, !bias_hz)?;
         check_covariance(&covariance, true)?;
         let epoch = config.reference_epoch();
         Ok(Self {
             config,
+            bias_hz,
             epoch,
             filter: Ekf::new(initial, covariance),
             timestamps: vec![epoch],
@@ -285,7 +352,7 @@ impl<const N: usize> OrbitEkf<N> {
         predicted.set_block(0, 0, &propagated);
         let mut candidate = Ekf::<f64, N, 1>::new(self.filter.x, self.filter.p);
         candidate.predict(|_| predicted, |_| transition, q);
-        check_parameters(&candidate.x)?;
+        check_parameters(&candidate.x, !self.bias_hz)?;
         check_covariance(&candidate.p, true)?;
         self.steps
             .push(record(candidate.x, candidate.p, transition));
@@ -315,7 +382,14 @@ impl<const N: usize> OrbitEkf<N> {
         }
         check_covariance(r, true)?;
         let state = V6::from_slice(&self.filter.x.as_slice()[..6]);
-        let (predicted, partial) = model.evaluate(&state)?;
+        let (mut predicted, partial) = model.evaluate(&state)?;
+        let mut h = Matrix::<f64, M, N>::zeros();
+        h.set_block(0, 0, &partial);
+        if self.bias_hz {
+            let bias = model.doppler_bias_partial();
+            predicted += bias * self.filter.x[6];
+            h.set_block(0, 6, &bias);
+        }
         let innovation = model.innovation(observed, &predicted);
         if !is_finite(&predicted) || !is_finite(&partial) || !is_finite(&innovation) {
             return Err(KernelError::InvalidInput(
@@ -323,8 +397,6 @@ impl<const N: usize> OrbitEkf<N> {
             )
             .into());
         }
-        let mut h = Matrix::<f64, M, N>::zeros();
-        h.set_block(0, 0, &partial);
         let mut candidate = Ekf::<f64, N, M>::new(self.filter.x, self.filter.p);
         // Feeding a zero prediction and the already computed innovation preserves
         // angular/custom residuals without subtracting large predictions twice.
@@ -334,7 +406,7 @@ impl<const N: usize> OrbitEkf<N> {
         }
         let accepted = options.gate.is_none_or(|gate| nis <= gate);
         if accepted {
-            check_parameters(&candidate.x)?;
+            check_parameters(&candidate.x, !self.bias_hz)?;
             check_covariance(&candidate.p, true)?;
             self.filter.x = candidate.x;
             self.filter.p = candidate.p;
@@ -615,8 +687,11 @@ fn is_finite<const R: usize, const C: usize>(matrix: &Matrix<f64, R, C>) -> bool
     matrix.as_slice().iter().all(|x| x.is_finite())
 }
 
-fn check_parameters<const N: usize>(state: &Vector<f64, N>) -> crate::kernels::Result<()> {
-    if N < 6 || !is_finite(state) || (N == 7 && state[6] < 0.0) {
+fn check_parameters<const N: usize>(
+    state: &Vector<f64, N>,
+    drag: bool,
+) -> crate::kernels::Result<()> {
+    if N < 6 || !is_finite(state) || (drag && N == 7 && state[6] < 0.0) {
         return Err(KernelError::InvalidInput(
             "EKF state must be finite with nonnegative drag",
         ));

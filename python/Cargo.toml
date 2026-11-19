@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "tychonic-python"
+version = "0.2.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Python adapters for the Tychonic orbit-determination core"
+repository = "https://github.com/Tycho887/tychonic"
+include = ["/Cargo.toml", "/Cargo.lock", "/src/**", "/examples/*.rs"]
+readme = "README.md"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tychonic = { path = ".." }
+tychonic-constrained = { path = "../constrained" }
+pyo3 = { version = "0.27", features = ["extension-module"] }
+numpy = "0.27"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+debug = 1

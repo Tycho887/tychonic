@@ -60,6 +60,56 @@ impl PropagationConfig {
         self.mode
     }
 
+    /// Transport a fitted orbit and optional joint covariance to an output epoch.
+    /// Coordinates after the configured six/seven orbital parameters remain constant.
+    /// Their cross-covariance with the orbit follows the same variational transition.
+    pub fn transport(
+        &self,
+        parameters: &numeris::DynVector<f64>,
+        covariance: Option<&numeris::DynMatrix<f64>>,
+        epoch: Instant,
+    ) -> Result<(numeris::DynVector<f64>, Option<numeris::DynMatrix<f64>>)> {
+        let n = self.mode.columns();
+        let total = parameters.len();
+        let values = parameters.as_slice();
+        if total < n || !values.iter().all(|v| v.is_finite()) {
+            return Err(KernelError::InvalidInput("invalid transport parameters"));
+        }
+        let sample = self.sample(&numeris::DynVector::from_slice(&values[..n]), &[epoch])?;
+        let mut state = numeris::DynVector::from_slice(values);
+        state.as_mut_slice()[..6].copy_from_slice(sample.states()[0].as_slice());
+        let Some(p) = covariance else {
+            return Ok((state, None));
+        };
+        if p.nrows() != total || p.ncols() != total || !p.as_slice().iter().all(|v| v.is_finite()) {
+            return Err(KernelError::InvalidInput(
+                "transport covariance dimensions or values",
+            ));
+        }
+        let mut transition = numeris::DynMatrix::from_fn(total, total, |i, j| f64::from(i == j));
+        let mut block = M7::eye();
+        if n == 7 {
+            block = sample.augmented_transition(0)?;
+        } else {
+            block.set_block(0, 0, &sample.stm()[0]);
+        }
+        for i in 0..n {
+            for j in 0..n {
+                transition[(i, j)] = block[(i, j)];
+            }
+        }
+        let transported = &transition * p * transition.transpose();
+        let symmetric = numeris::DynMatrix::from_fn(total, total, |i, j| {
+            0.5 * transported[(i, j)] + 0.5 * transported[(j, i)]
+        });
+        if !symmetric.as_slice().iter().all(|v| v.is_finite()) {
+            return Err(KernelError::Numerical(
+                "transported covariance exceeds numeric range",
+            ));
+        }
+        Ok((state, Some(symmetric)))
+    }
+
     pub fn sample(
         &self,
         parameters: &numeris::DynVector<f64>,

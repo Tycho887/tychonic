@@ -66,6 +66,7 @@ pub struct ODProblem<'g> {
     timestamps: Vec<Instant>,
     mappings: Vec<Vec<usize>>,
     rows: usize,
+    prior: Option<(DynVector<f64>, numeris::DynMatrix<f64>)>,
 }
 
 impl<'g> ODProblem<'g> {
@@ -99,8 +100,39 @@ impl<'g> ODProblem<'g> {
             batches,
             timestamps,
             mappings,
+            prior: None,
             rows,
         })
+    }
+
+    /// Include one independent Gaussian prior at the reference epoch.
+    /// The rows appended to the objective are L^-1 (x - mean), where LL^T=P.
+    pub fn with_prior(
+        mut self,
+        mean: DynVector<f64>,
+        covariance: &numeris::DynMatrix<f64>,
+    ) -> Result<Self> {
+        let n = self.config.mode().columns();
+        if self.prior.is_some() || mean.len() != n || !mean.as_slice().iter().all(|v| v.is_finite())
+        {
+            return Err(KernelError::InvalidInput("invalid or repeated orbit prior"));
+        }
+        let factor = crate::measurements::factor_covariance(covariance, n)?;
+        let lower = factor.l();
+        let mut whitening = numeris::DynMatrix::zeros(n, n);
+        for i in 0..n {
+            for j in 0..=i {
+                let sum: f64 = (j..i).map(|k| lower[(i, k)] * whitening[(k, j)]).sum();
+                whitening[(i, j)] = (f64::from(i == j) - sum) / lower[(i, i)];
+            }
+        }
+        self.rows = self
+            .rows
+            .checked_add(n)
+            .filter(|rows| rows.checked_mul(n).is_some())
+            .ok_or(KernelError::InvalidInput("prior dimensions overflow"))?;
+        self.prior = Some((mean, whitening));
+        Ok(self)
     }
 
     pub fn from_measurements(
@@ -129,6 +161,11 @@ impl<'g> ODProblem<'g> {
     pub fn timestamps(&self) -> &[Instant] {
         &self.timestamps
     }
+    /// True when the objective includes independent prior information.
+    pub fn uses_weighted_prior(&self) -> bool {
+        self.prior.is_some()
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
@@ -149,6 +186,16 @@ impl<'g> ODProblem<'g> {
         for (batch, mapping) in self.batches.iter().zip(&self.mappings) {
             batch.evaluate_mapped_into(&sens, Some(mapping), output, offset, self.rows)?;
             offset += batch.rows();
+        }
+        if let Some((mean, whitening)) = &self.prior {
+            for i in 0..mean.len() {
+                output.residual[offset + i] = (0..=i)
+                    .map(|j| whitening[(i, j)] * (parameters[j] - mean[j]))
+                    .sum();
+                for j in 0..mean.len() {
+                    output.jacobian[(offset + i, j)] = whitening[(i, j)];
+                }
+            }
         }
         Ok(())
     }

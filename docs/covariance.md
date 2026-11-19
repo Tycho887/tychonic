@@ -33,6 +33,12 @@ products of the corresponding physical units. Joint observation order is
 Doppler Hz, continuous phase rad, differential Doppler Hz, azimuth rad,
 elevation rad, omitting absent components. Correlations are retained.
 
+In 0.10.1, `ODProblem::with_prior(mean, covariance)` adds an independent Gaussian
+prior at the reference epoch. Its whitened residuals contribute to RSS and its
+precision contributes to the final information matrix. A fit using this option
+returns a local posterior covariance. An initial guess by itself contributes
+zero weight. The [Python API](python.md) records this choice in the fit result.
+
 ## Numerical method
 
 Normalize each nonzero physical Jacobian column by its Euclidean norm. Apply
@@ -59,10 +65,10 @@ returned. Existing contact-bias Varpro retains residual-scaled Schur covariance.
 references, unit invariance, optimizer-scale invariance, six/seven parameters,
 rank errors, large-batch memory behavior, and numerical-range failures.
 
-To export a deterministic generation-2 DART normalized request:
+Export the two-contact observation fixture with the following command.
 
 ```sh
-DART_FIXTURE_OUTPUT=/tmp/dart-mixed-lm.json SATKIT_OFFLINE=1 \
+TYCHONIC_FIXTURE_OUTPUT=/tmp/tychonic-mixed-lm.json SATKIT_OFFLINE=1 \
   cargo test --locked --test covariance generation_two_fixture_has_later_held_out_observations
 ```
 

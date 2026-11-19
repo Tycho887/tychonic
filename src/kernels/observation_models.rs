@@ -287,21 +287,29 @@ enum BatchData {
 #[derive(Debug)]
 pub struct PreparedBatch<'g> {
     geometry: GeometrySource<'g>,
-    data: BatchData,
+    data: crate::optim::InputSource<'g, BatchData>,
 }
 
 impl<'g> PreparedBatch<'g> {
+    /// Borrow validated data and geometry without copying or factoring the observation covariance again.
+    pub fn as_borrowed(&self) -> PreparedBatch<'_> {
+        PreparedBatch {
+            geometry: self.geometry().into(),
+            data: (&*self.data).into(),
+        }
+    }
+
     pub(crate) fn from_joint(
         geometry: impl Into<GeometrySource<'g>>,
         joint: crate::measurements::JointBatch,
     ) -> Self {
         Self {
             geometry: geometry.into(),
-            data: BatchData::Joint(Box::new(joint)),
+            data: BatchData::Joint(Box::new(joint)).into(),
         }
     }
     fn observations(&self) -> &[ObservationColumn] {
-        match &self.data {
+        match &*self.data {
             BatchData::RangeRate(observations)
             | BatchData::PhaseDifference { observations, .. } => observations,
             BatchData::AzimuthElevation(observations) => observations,
@@ -311,7 +319,7 @@ impl<'g> PreparedBatch<'g> {
     }
     /// Number of physical components per epoch, including both angles.
     pub fn components(&self) -> usize {
-        match &self.data {
+        match &*self.data {
             BatchData::Joint(joint) => joint.dimension(),
             _ => self.observations().len(),
         }
@@ -323,7 +331,7 @@ impl<'g> PreparedBatch<'g> {
         &self,
         row: usize,
     ) -> Result<crate::estimate::Observation<M, crate::measurements::CalibratedSensor<'_, M>>> {
-        match &self.data {
+        match &*self.data {
             BatchData::Joint(joint) => joint.observation(&self.geometry, row),
             _ => Err(KernelError::InvalidInput(
                 "batch is not a joint passive batch",
@@ -382,7 +390,7 @@ impl<'g> PreparedBatch<'g> {
     }
     /// Supplied ENU baselines in measurement order, for a legacy phase batch.
     pub fn baselines_enu_m(&self) -> Option<&[V3]> {
-        match &self.data {
+        match &*self.data {
             BatchData::PhaseDifference {
                 baselines_enu_m, ..
             } => Some(baselines_enu_m),
@@ -390,7 +398,7 @@ impl<'g> PreparedBatch<'g> {
         }
     }
     pub fn interferometer(&self) -> Option<Interferometer> {
-        match self.data {
+        match *self.data {
             BatchData::PhaseDifference { interferometer, .. } => Some(interferometer),
             _ => None,
         }
@@ -479,7 +487,7 @@ impl<'g> PreparedBatch<'g> {
     fn new(geometry: impl Into<GeometrySource<'g>>, data: BatchData) -> Result<Self> {
         let batch = Self {
             geometry: geometry.into(),
-            data,
+            data: data.into(),
         };
         if batch.geometry.is_empty() {
             return Err(KernelError::InvalidInput("empty observation batch"));
@@ -509,7 +517,7 @@ impl<'g> PreparedBatch<'g> {
         &self.geometry
     }
     pub fn kind(&self) -> MeasurementKind {
-        match self.data {
+        match *self.data {
             BatchData::RangeRate(_) => MeasurementKind::RangeRate,
             BatchData::PhaseDifference { .. } => MeasurementKind::PhaseDifference,
             BatchData::AzimuthElevation(_) => MeasurementKind::AzimuthElevation,
@@ -596,7 +604,7 @@ impl<'g> PreparedBatch<'g> {
         }
         sens.validate_mapping(self.timestamps(), mapping)?;
         output.resize(total_rows, columns)?;
-        match (&self.data, columns) {
+        match (&*self.data, columns) {
             (BatchData::Joint(joint), _) => {
                 joint.evaluate(&self.geometry, sens, mapping, output, offset)
             }

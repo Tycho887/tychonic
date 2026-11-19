@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tychonic"
-version = "0.1.0"
+version = "0.2.0"
 description = "Orbit determination, sensor fusion, and satellite acquisition backed by Rust"
 readme = "python/README.md"
 requires-python = ">=3.11,<3.15"
@@ -27,6 +27,8 @@ Documentation = "https://github.com/Tycho887/tychonic/blob/main/docs/python.md"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "ruff>=0.9", "radon>=6"]
+polars = ["polars>=1"]
+tdm = ["pandas>=2.2"]
 
 [tool.maturin]
 manifest-path = "python/Cargo.toml"

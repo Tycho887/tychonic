@@ -16,6 +16,7 @@ pub struct Fixture {
     pub sigmas: Vec<f64>,
     pub epoch: Instant,
     span: f64,
+    use_space_weather: bool,
 }
 
 impl Fixture {
@@ -24,6 +25,10 @@ impl Fixture {
     }
 
     pub fn with_centers(offsets: [f64; 3]) -> Self {
+        Self::with_space_weather(offsets, od_prop_settings().use_spaceweather)
+    }
+
+    pub fn with_space_weather(offsets: [f64; 3], use_space_weather: bool) -> Self {
         let epoch = Instant::from_date(2024, 1, 1).unwrap();
         let truth = V7::from_slice(&[6.65e6, 2e4, -4e4, 0., 6800., 3660., 0.02]);
         let seed = truth + V7::from_slice(&[80., -90., 60., -0.06, 0.07, 0.05, -0.003]);
@@ -33,7 +38,7 @@ impl Fixture {
             .map(|&t| epoch + Duration::from_seconds(t))
             .collect();
         let params = DynVector::from_slice(truth.as_slice());
-        let cfg = config_with_span(epoch, span);
+        let cfg = config_with_span(epoch, span, use_space_weather);
         let center_states = cfg.sample(&params, &centers).unwrap();
         let mut times = Vec::new();
         let mut sites = Vec::new();
@@ -87,6 +92,7 @@ impl Fixture {
             angles,
             biases,
             span,
+            use_space_weather,
             sigmas,
             epoch,
         }
@@ -94,7 +100,7 @@ impl Fixture {
 
     pub fn model(&self, selection: PointingSelection, fov: f64) -> ConstrainedRangeRateProblem {
         ConstrainedRangeRateProblem::new(
-            config_with_span(self.epoch, self.span),
+            self.config(),
             self.seed,
             &self.rates,
             &self.sigmas,
@@ -104,9 +110,15 @@ impl Fixture {
         )
         .unwrap()
     }
+
+    pub fn config(&self) -> PropagationConfig {
+        config_with_span(self.epoch, self.span, self.use_space_weather)
+    }
 }
-pub fn config_with_span(epoch: Instant, seconds: f64) -> PropagationConfig {
+
+fn config_with_span(epoch: Instant, seconds: f64, use_space_weather: bool) -> PropagationConfig {
     let mut settings = od_prop_settings();
+    settings.use_spaceweather = use_space_weather;
     let span = Duration::from_seconds(seconds);
     settings
         .precompute_terms(&(epoch - span), &(epoch + span))

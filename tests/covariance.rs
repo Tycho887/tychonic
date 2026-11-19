@@ -71,9 +71,11 @@ fn singular_underdetermined_and_nonfinite_jacobians_return_structured_errors() {
 }
 
 fn config(drag: bool) -> PropagationConfig {
+    let mut settings = od_prop_settings();
+    settings.use_spaceweather = false;
     PropagationConfig::new(
         Instant::from_unixtime(1704110400.25),
-        od_prop_settings(),
+        settings,
         if drag {
             ParameterMode::StateAndDrag { delta_cd: 1e-4 }
         } else {
@@ -335,11 +337,68 @@ fn generation_two_fixture_has_later_held_out_observations() {
         "{{\"estimator\":\"batch_lm\",\"spacecraft_id\":\"fixture-spacecraft\",\"reference_epoch_unix_s\":1704110400.25,\"initial_state_gcrf\":{prior:?},\"observations\":[{}],\"carrier_hz\":2230000000.0,\"sigma_doppler_hz\":0.5,\"sigma_angle_rad\":0.0001,\"fixed_drag_m2_kg\":0.02,\"max_iterations\":400,\"gradient_tolerance\":0.0001,\"step_tolerance\":0.00000001,\"cost_tolerance\":0.0000000001}}\n",
         rows.join(",")
     );
-    if let Ok(path) = std::env::var("DART_FIXTURE_OUTPUT") {
+    if let Ok(path) = std::env::var("TYCHONIC_FIXTURE_OUTPUT") {
         std::fs::write(path, fixture).unwrap();
     }
 }
 
 fn baseline() -> V3 {
     v3(59.0, 3.0, 0.2)
+}
+
+#[test]
+fn correlated_prior_adds_its_information_once_in_physical_coordinates() {
+    let (batches, x, _) = fixture(false, 0.0);
+    let prior = DynMatrix::from_fn(6, 6, |i, j| match (i, j) {
+        (0, 3) | (3, 0) => 0.4,
+        _ if i == j && i < 3 => 100.0,
+        _ if i == j => 0.04,
+        _ => 0.0,
+    });
+    let problem = ODProblem::new(config(false), batches).unwrap();
+    let base = problem.evaluate(&x).unwrap();
+    let expected = (&base.jacobian.transpose() * &base.jacobian + prior.inverse().unwrap())
+        .inverse()
+        .unwrap();
+    let problem = problem
+        .with_prior(DynVector::from_slice(x.as_slice()), &prior)
+        .unwrap();
+    let actual = fit_lm_with_covariance(&problem, &x, None, &settings()).unwrap();
+    assert!(problem.uses_weighted_prior());
+    for i in 0..6 {
+        for j in 0..6 {
+            close(actual.covariance[(i, j)], expected[(i, j)], 1e-8, 1e-6);
+        }
+    }
+}
+
+#[test]
+fn transport_preserves_fitted_drag_and_auxiliary_cross_covariance() {
+    let cfg = config(true);
+    let (_, x, _) = fixture(true, 0.0);
+    let time = cfg.reference_epoch() + Duration::from_seconds(41.0);
+    let sample = cfg.sample(&x, &[time]).unwrap();
+    let orbital = sample.augmented_transition(0).unwrap();
+    let transition = DynMatrix::from_fn(8, 8, |i, j| {
+        if i < 7 && j < 7 {
+            orbital[(i, j)]
+        } else {
+            f64::from(i == j)
+        }
+    });
+    let p = DynMatrix::from_fn(8, 8, |i, j| if i == j { 1.0 } else { 0.12 });
+    let expected = &transition * &p * transition.transpose();
+    let mut values = x.as_slice().to_vec();
+    values.push(-23.0);
+    let (transported, matrix) = cfg
+        .transport(&DynVector::from_vec(values), Some(&p), time)
+        .unwrap();
+    let matrix = matrix.unwrap();
+    assert_eq!(transported[6], x[6]);
+    assert_eq!(transported[7], -23.0);
+    for i in 0..8 {
+        for j in 0..8 {
+            close(matrix[(i, j)], expected[(i, j)], 1e-9, 1e-10);
+        }
+    }
 }

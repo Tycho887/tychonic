@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.1 (release candidate)
+
+- Calibrated LM accepts an explicit independent Gaussian prior. Fitted state and full covariance can be transported to a publication epoch with the native variational model.
+- Add fixed-drag Cartesian EKFs with additive Doppler bias in Hz and TCA UKFs with per-reading carrier and correlated Doppler/pointing noise. Existing drag and range-rate filter constructors remain available.
+- Add the independently versioned Python 0.2.0 mixed Rust/Python distribution, including all four batch profiles, per-spacecraft checkpoint/restore, epoch-linked RTS smoothing, MPC and CCSDS exports. See the [Python guide](docs/python.md).
+
 ## 0.10.0 (unreleased)
 
 - Add a prepared seven-variable range-rate NLP with projected pass biases, frozen closest-approach sampling and hard circular field-of-view bounds.
