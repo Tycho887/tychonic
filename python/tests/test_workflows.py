@@ -299,24 +299,31 @@ def test_ukf_carrier_checkpoint_and_replacement(reference):
     )
 
 
-def test_mean_elements_exports(reference):
-    data = reference["acquisition"]
-    tle = tuple(data["tle"].strip().splitlines()[-2:])
-    seed = tc.StateEstimate.from_tle(
-        tle,
-        at=data["start"],
-        uncertainty=tc.TleAgeUncertainty(
-            sigma_at_epoch=(1,) * 6, sigma_growth_per_day=(0,) * 6
-        ),
-    )
+@pytest.mark.parametrize("offset_s", [0.0, 299.875])
+def test_mean_elements_exports(reference, offset_s):
     from datetime import datetime, timedelta
 
-    start = datetime.fromisoformat(data["start"])
+    data = reference["acquisition"]
+    tle = tuple(data["tle"].strip().splitlines()[-2:])
+    start = datetime.fromisoformat(data["start"]) + timedelta(seconds=offset_s)
+    epoch = start.isoformat().replace("+00:00", "Z")
+    uncertainty = tc.TleAgeUncertainty(
+        sigma_at_epoch=(1,) * 6, sigma_growth_per_day=(0,) * 6
+    )
+    seed = tc.StateEstimate.from_tle(
+        tle,
+        at=epoch,
+        uncertainty=uncertainty,
+    )
+    # A three-hour arc constrains the fit; a ten-minute arc can exhaust the solver.
     epochs = [
-        (start + timedelta(seconds=(i - 5) * 60)).isoformat().replace("+00:00", "Z")
-        for i in range(11)
+        (start + timedelta(minutes=(i - 30) * 3)).isoformat().replace("+00:00", "Z")
+        for i in range(61)
     ]
-    assert len(seed.to_tle(epochs, force_model=FORCES)) == 2
+    exported = seed.to_tle(epochs, force_model=FORCES)
+    assert len(exported) == 2
+    restored = tc.StateEstimate.from_tle(exported, at=epoch, uncertainty=uncertainty)
+    assert np.linalg.norm(restored.position_m - seed.position_m) < 500
     assert float(seed.to_omm(epochs, force_model=FORCES)["MEAN_MOTION"]) > 0
 
 

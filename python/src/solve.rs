@@ -213,7 +213,10 @@ pub fn mean_elements(
                     | tychonic::satkit::tle::TleFitStatus::DampingSaturated
             )
         {
-            return Err(SolverError::new_err("invalid mean-element fit"));
+            return Err(SolverError::new_err(format!(
+                "mean-element fit failed: {} after {} iterations (residual norm {:.3e} m)",
+                result.status, result.n_iter, result.best_norm
+            )));
         }
         elements(&tle)
     })
