@@ -138,7 +138,7 @@ pub struct PreparedGeometry {
 }
 
 type StationKey = (u64, u64, u64);
-fn station_key(s: &GroundStation) -> StationKey {
+pub(crate) fn station_key(s: &GroundStation) -> StationKey {
     (s.lat_deg.to_bits(), s.lon_deg.to_bits(), s.alt_m.to_bits())
 }
 

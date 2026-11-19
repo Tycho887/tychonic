@@ -422,6 +422,28 @@ fn sample_arc<const C: usize>(
     Ok(samples)
 }
 
+/// State-only dense sampling for the seed-orbit closest-approach search.
+pub(crate) fn sample_seed_states(
+    config: &PropagationConfig,
+    seed: &V7,
+    times: &[Instant],
+) -> Result<Vec<V6>> {
+    let state = seed.block::<6, 1>(0, 0);
+    check_state(&state)?;
+    check_drag_value(seed[6])?;
+    let states = sample_arc(
+        &state,
+        &config.reference_epoch,
+        times,
+        &config.settings,
+        &SatPropertiesSimple::new(seed[6], 0.0),
+    )?;
+    for state in &states {
+        check_state(state)?;
+    }
+    Ok(states)
+}
+
 /// Sample one nominal state/STM arc per direction with fixed drag. No drag
 /// perturbation arcs are evaluated; `state_dcd` is empty in the result.
 pub fn compute_state_transitions(

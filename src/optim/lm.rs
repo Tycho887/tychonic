@@ -31,7 +31,7 @@ pub(super) fn run_lm_with_drag(
     drag_index: Option<usize>,
     mut evaluate: impl FnMut(&DynVector<f64>, &mut Evaluation) -> Result<()>,
 ) -> std::result::Result<LmOutcome, FitError> {
-    let defaults = [100.0, 100.0, 100.0, 0.1, 0.1, 0.1, 0.01];
+    let defaults = super::DEFAULT_SCALES;
     let scales = scales.unwrap_or_else(|| defaults.get(..columns).unwrap_or(&[]));
     let coordinates = Coordinates::new(guess, scales, columns, drag_index)?;
     validate_settings(settings)?;

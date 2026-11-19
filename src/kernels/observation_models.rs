@@ -717,7 +717,7 @@ impl<'g> PreparedBatch<'g> {
     }
 }
 
-fn compose_sample<const M: usize, const P: usize>(
+pub(crate) fn compose_sample<const M: usize, const P: usize>(
     partial: &Matrix<f64, M, 6>,
     sample: &SensitivityRow<'_>,
 ) -> Matrix<f64, M, P> {

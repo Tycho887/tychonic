@@ -5,11 +5,15 @@ Passive orbit determination in Rust using **satkit** for astrodynamics and
 observables and analytic state derivatives, fits batches, and updates an orbit
 as new measurements arrive.
 
-Version **0.9.7** accepts extracted Doppler, phase difference, differential
+Tychonic accepts extracted Doppler, phase difference, differential
 Doppler, and azimuth/elevation. Each calibrated observable works independently,
 and any combination can be fused with full covariance. Fitting requires an
 initial orbit guess; initialization without one is future work. IQ processing,
 phase unwrapping, and cycle-slip detection belong upstream.
+
+The upcoming **0.10.0** release adds seven-parameter range-rate fitting with
+hard antenna field-of-view constraints, per-pass biases, and a Rust
+interior-point solver. See the [constrained fitting guide](docs/constrained_range_rate.md).
 
 Version **0.9.7** was published to crates.io on 2026-11-11. It includes
 the absolute calibrated covariance APIs from 0.9.4 and the behavioral antenna

@@ -5,6 +5,12 @@ Version **0.9.7** was published to crates.io on **2026-11-11** from clean commit
 The published archive's SHA-256 is
 `0f5b6a4c16ee6bfcf09cfb7bc2d50934e44392e1c0d17e8fd8f00facad4bbbdf`.
 
+The 0.10.0 workspace contains `tychonic` and `tychonic-constrained`. Verify
+both source packages together with `cargo package --workspace --locked`.
+For publication, publish the core first, then the companion after the registry
+can resolve the matching core version. The companion's native IPOPT comparison
+runs separately from its Rust build. See the [qualification commands](constrained_range_rate.md).
+
 The canonical source checkout is `/home/michaeljohansen/tychonic`. Prepare and
 verify future releases in this repository. Before the next publication, update
 the package version, both lockfiles, installation example, and changelog.

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.0 (unreleased)
+
+- Add a prepared seven-variable range-rate NLP with projected pass biases, frozen closest-approach sampling and hard circular field-of-view bounds.
+- Add the opt-in `tychonic-constrained` Rust solver crate using ripopt 0.8.2, and native IPOPT qualification. See the [fitting guide](docs/constrained_range_rate.md).
+
 ## 0.9.7 (2026-11-11)
 
 - **Breaking:** move surveyed baselines out of `Interferometer`; construction now

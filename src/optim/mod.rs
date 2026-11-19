@@ -1,4 +1,5 @@
 //! Thin stacking and LM integration over verified observation kernels.
+pub mod constrained;
 pub mod passive_rf;
 pub mod varpro;
 pub use passive_rf::*;
@@ -23,6 +24,9 @@ mod lm;
 use lm::{run_lm, run_lm_with_drag};
 use satkit::{Instant, orbitprop::PropSettings};
 use std::{collections::BTreeMap, fmt};
+
+/// Physical reference parameters are GCRF m, m/s, and constant Cd A/m in m²/kg.
+pub const DEFAULT_SCALES: [f64; 7] = [100., 100., 100., 0.1, 0.1, 0.1, 0.01];
 
 /// Immutable collection of batches with a prepared union of exact epochs.
 #[derive(Debug)]
