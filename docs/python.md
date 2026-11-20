@@ -1,5 +1,10 @@
 # Python orbit estimation
 
+| To look up | Reference |
+| --- | --- |
+| Observation columns, solver profiles, spacecraft catalogues, exports, or satellite acquisition | [`tychonic` API reference](python-api.md) |
+| Measurement factories, propagation settings, individual filters, or a custom receiver callback | [`tychonic.low_level` API reference](python-low-level.md) |
+
 ## Preparing observations
 
 Create one `JobData` per spacecraft UUID. Group simultaneous columns by contact,

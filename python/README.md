@@ -34,5 +34,7 @@ checkpoint = catalogue.checkpoint(next_contact.spacecraft_id)
 
 The [Python guide](https://github.com/Tycho887/tychonic/blob/main/docs/python.md)
 describes input conventions, solver profiles, checkpoints, and acquisition.
-The adapters recovered from the earlier 0.1.0 prototype are available under
-`tychonic.low_level`.
+For signatures, arguments, and return values, see the
+[`tychonic` API reference](https://github.com/Tycho887/tychonic/blob/main/docs/python-api.md).
+The measurement helpers and adapters from the earlier 0.1.0 prototype have a
+separate [`tychonic.low_level` reference](https://github.com/Tycho887/tychonic/blob/main/docs/python-low-level.md).
